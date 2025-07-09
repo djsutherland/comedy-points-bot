@@ -61,7 +61,6 @@ PTS_PAIRS = {
 }
 PTS_VALUES = list(PTS_PAIRS.keys())
 PTS_CUM_WTS = list(itertools.accumulate(PTS_PAIRS.values()))
-print(PTS_CUM_WTS[-1])
 
 
 class Points(commands.Cog):
