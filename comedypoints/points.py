@@ -120,7 +120,7 @@ class Points(commands.Cog):
             if voted_for_self:
                 await message.reply(
                     f"{message.author.mention}, "
-                    f"you have been deducted {points} for voting for yourself."
+                    f"you have been fined {points} for voting for yourself."
                 )
             else:
                 hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
