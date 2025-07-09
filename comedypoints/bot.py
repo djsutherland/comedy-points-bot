@@ -16,6 +16,7 @@ class ComedyPointsBot(commands.Bot):
         )
         self.initial_extensions = [
             "comedypoints.basics",
+            "comedypoints.fix_reacts",
             "comedypoints.points",
             "comedypoints.privateperms",
         ]
