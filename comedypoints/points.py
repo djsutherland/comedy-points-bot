@@ -1,3 +1,4 @@
+import datetime
 import itertools
 import random
 
@@ -6,6 +7,7 @@ from discord.ext import commands
 from .utils import LRUCache
 
 
+START_OF_TIME = datetime.datetime(2025, 7, 1, tzinfo=datetime.timezone.utc)
 VOTING_EMOJI_ID = 748975694540832848
 
 HALLS_OF_FAME = {
@@ -90,6 +92,9 @@ class Points(commands.Cog):
         channel = self.bot.get_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
         guild = message.guild
+
+        if message.created_at < START_OF_TIME:
+            return
 
         for reaction in message.reactions:
             if getattr(reaction.emoji, "id", 0) == VOTING_EMOJI_ID:
