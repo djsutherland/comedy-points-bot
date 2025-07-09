@@ -9,6 +9,7 @@ class ComedyPointsBot(commands.Bot):
 
     def __init__(self, **kwargs):
         intents = discord.Intents.default()
+        intents.reactions = True
 
         super().__init__(
             intents=intents, command_prefix=commands.when_mentioned, **kwargs

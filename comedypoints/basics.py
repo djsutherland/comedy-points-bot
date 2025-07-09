@@ -1,6 +1,8 @@
 import logging
 from discord.ext import commands
 
+_log = logging.getLogger(__name__)
+
 
 class Basics(commands.Cog):
     def __init__(self, bot):
@@ -28,11 +30,11 @@ class Basics(commands.Cog):
             await self.bot.load_extension(module)
         except Exception as e:
             info = f"{type(e).__name__}: {e}"
-            logging.error(f"Exception in loading {module}\n{info}")
+            _log.error(f"Exception in loading {module}\n{info}")
             await ctx.message.add_reaction("\N{PISTOL}")
             await ctx.send(f"```{info}```")
         else:
-            logging.info(f"Loaded {module}")
+            _log.info(f"Loaded {module}")
             await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
     @commands.command(hidden=True)
@@ -43,11 +45,11 @@ class Basics(commands.Cog):
             await self.bot.unload_extension(module)
         except Exception as e:
             info = f"{type(e).__name__}: {e}"
-            logging.error(f"Exception in unloading {module}\n{info}")
+            _log.error(f"Exception in unloading {module}\n{info}")
             await ctx.message.add_reaction("\N{PISTOL}")
             await ctx.send(f"```{info}```")
         else:
-            logging.info(f"Unloaded {module}")
+            _log.info(f"Unloaded {module}")
             await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
     @commands.command(hidden=True)
@@ -62,11 +64,11 @@ class Basics(commands.Cog):
             await self.bot.load_extension(module)
         except Exception as e:
             info = f"{type(e).__name__}: {e}"
-            logging.error(f"Exception in reloading {module}\n{info}")
+            _log.error(f"Exception in reloading {module}\n{info}")
             await ctx.message.add_reaction("\N{PISTOL}")
             await ctx.send(f"```{info}```")
         else:
-            logging.info(f"Reloaded {module}")
+            _log.info(f"Reloaded {module}")
             await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
     @commands.Cog.listener()
@@ -82,6 +84,7 @@ class Basics(commands.Cog):
         channel = self.bot.get_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
         await message.delete()
+
 
 async def setup(bot):
     await bot.add_cog(Basics(bot))
