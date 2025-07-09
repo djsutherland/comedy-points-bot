@@ -68,6 +68,16 @@ class Points(commands.Cog):
     def __init__(self, bot, cache_size=1024):
         self.bot = bot
         self._inducted_cache = LRUCache(cache_size)
+        self._channel_is_private = LRUCache(cache_size)
+
+    def channel_is_private(self, channel):
+        if channel in self._channel_is_private:
+            return self._channel_is_private[channel]
+
+        everyone = channel.guild.default_role
+        result = not channel.permissions_for(everyone).read_messages
+        self._channel_is_private[channel] = result
+        return result
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
@@ -108,14 +118,20 @@ class Points(commands.Cog):
                     f"{message.author.mention}, "
                     f"you have been deducted {points} for voting for yourself."
                 )
-
-            if not voted_for_self:
-                await message.reply(
-                    f"{message.author.mention}, you have been awarded {points}."
-                )
+            else:
                 hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
-                await hall.send(f"{message.author.mention} was awarded {points}.")
-                await message.forward(hall)
+
+                base = f"{message.author.mention} was awarded {points} for"
+                if self.channel_is_private(channel):
+                    induction = await hall.send(f"{base} {message.jump_url}.")
+                else:
+                    induction = await hall.send(f"{base}:")
+                    await message.forward(hall)
+
+                await message.reply(
+                    f"{message.author.mention}, you have been awarded {points} "
+                    f"({induction.jump_url})."
+                )
 
             await message.add_reaction(payload.emoji)
             self._inducted_cache[payload.message_id] = True
