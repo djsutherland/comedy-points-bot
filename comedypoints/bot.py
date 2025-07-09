@@ -14,7 +14,11 @@ class ComedyPointsBot(commands.Bot):
         super().__init__(
             intents=intents, command_prefix=commands.when_mentioned, **kwargs
         )
-        self.initial_extensions = ["comedypoints.basics"]
+        self.initial_extensions = [
+            "comedypoints.basics",
+            "comedypoints.points",
+            "comedypoints.privateperms",
+        ]
 
     async def setup_hook(self):
         async with asyncio.TaskGroup() as tg:
