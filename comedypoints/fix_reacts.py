@@ -1,6 +1,5 @@
 from logging import getLogger
 
-import discord
 from discord.ext import commands
 
 logger = getLogger(__name__)

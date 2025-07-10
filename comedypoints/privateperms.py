@@ -58,19 +58,21 @@ class PrivatePerms(commands.Cog):
                 member = await channel.guild.fetch_member(user.id)
                 if member is None:
                     # apparently they've left the server, just delete the react
-                    logging.warn(f"Couldn't find Member for {user}; removing their reaction")
+                    logger.warn(
+                        f"Couldn't find Member for {user}; removing their reaction"
+                    )
                     await message.remove_reaction(emoji, user)
                 else:
                     user = member
 
             try:
-                logging.warn(f"Trying to add {user}")
+                logger.warn(f"Trying to add {user}")
                 await channel.set_permissions(user, view_channel=True)
                 await message.remove_reaction(emoji, user)
             except discord.errors.Forbidden:
                 # this might happen if someone with a higher role than me reacts
                 # but let's try to handle the other people anyway
-                logging.exception(
+                logger.exception(
                     f"Permissions error."
                     f"Was trying to add {user} to {channel} based on {message.jump_url}"
                 )
@@ -92,6 +94,7 @@ class PrivatePerms(commands.Cog):
             else:
                 for who, override in channel.overwrites.items():
                     await ctx.reply(f"{channel.jump_url}: {who} - {override.pair()}")
+
 
 async def setup(bot):
     await bot.add_cog(PrivatePerms(bot))
