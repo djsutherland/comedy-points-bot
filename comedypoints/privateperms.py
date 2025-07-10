@@ -84,17 +84,5 @@ class PrivatePerms(commands.Cog):
             )
             await message.add_reaction(emoji)
 
-    @commands.command(hidden=True)
-    @commands.is_owner()
-    async def debug_perms(self, ctx):
-        for _, channel_id in SETUPS.values():
-            channel = self.bot.get_channel(channel_id)
-            if channel is None:
-                await ctx.reply(f"Can't load channel {channel_id}")
-            else:
-                for who, override in channel.overwrites.items():
-                    await ctx.reply(f"{channel.jump_url}: {who} - {override.pair()}")
-
-
 async def setup(bot):
     await bot.add_cog(PrivatePerms(bot))
