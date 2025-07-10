@@ -1,7 +1,9 @@
-import logging
+from logging import getLogger
 
 import discord
 from discord.ext import commands
+
+logger = getLogger(__name__)
 
 
 SETUPS = {  # post id: (emoji, channel id)
@@ -38,6 +40,9 @@ class PrivatePerms(commands.Cog):
             if reaction.emoji == emoji:
                 break
         else:  # no reactions with the right emoji; i should add it
+            logger.warn(
+                f"There were no reactions with {emoji} on {message.jump_url}; adding it"
+            )
             await message.add_reaction(emoji)
             return
 
@@ -53,11 +58,13 @@ class PrivatePerms(commands.Cog):
                 member = await channel.guild.fetch_member(user.id)
                 if member is None:
                     # apparently they've left the server, just delete the react
+                    logging.warn(f"Couldn't find Member for {user}; removing their reaction")
                     await message.remove_reaction(emoji, user)
                 else:
                     user = member
 
             try:
+                logging.warn(f"Trying to add {user}")
                 await channel.set_permissions(user, view_channel=True)
                 await message.remove_reaction(emoji, user)
             except discord.errors.Forbidden:
@@ -70,8 +77,21 @@ class PrivatePerms(commands.Cog):
                 continue
 
         if not found_me:
+            logger.warn(
+                f"I hadn't reacted with {emoji} to {message.jump_url}; doing that"
+            )
             await message.add_reaction(emoji)
 
+    @commands.command(hidden=True)
+    @commands.is_owner()
+    async def debug_perms(self, ctx):
+        for _, channel_id in SETUPS.values():
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                await ctx.reply(f"Can't load channel {channel_id}")
+            else:
+                for who, override in channel.overwrites.items():
+                    await ctx.reply(f"{channel.jump_url}: {who} - {override.pair()}")
 
 async def setup(bot):
     await bot.add_cog(PrivatePerms(bot))

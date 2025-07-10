@@ -1,4 +1,4 @@
-import logging
+from logging import getLogger
 
 import datetime
 import itertools
@@ -7,6 +7,8 @@ import random
 from discord.ext import commands
 
 from .utils import LRUCache
+
+logger = getLogger(__name__)
 
 
 START_OF_TIME = datetime.datetime(2025, 7, 1, tzinfo=datetime.timezone.utc)
@@ -102,7 +104,7 @@ class Points(commands.Cog):
             if getattr(reaction.emoji, "id", 0) == VOTING_EMOJI_ID:
                 break
         else:
-            logging.warning(
+            logger.warning(
                 f"couldn't find voting reaction on {message.jump_url} "
                 f"even though {payload.user_id} reacted"
             )
@@ -112,7 +114,7 @@ class Points(commands.Cog):
         voted_for_self = False
         async for user in reaction.users():
             if user == self.bot.user:
-                logging.info(f"{message.jump_url} already inducted")
+                logger.info(f"{message.jump_url} already inducted")
                 # already inducted
                 self._inducted_cache[payload.message_id] = True
                 return
@@ -125,13 +127,13 @@ class Points(commands.Cog):
             (points,) = random.choices(PTS_VALUES, cum_weights=PTS_CUM_WTS)
 
             if voted_for_self:
-                logging.info(f"{message.jump_url} getting demerited")
+                logger.info(f"{message.jump_url} getting demerited")
                 await message.reply(
                     f"{message.author.mention}, "
                     f"you have been fined {points} for voting for yourself."
                 )
             else:
-                logging.info(f"inducting {message.jump_url}")
+                logger.info(f"inducting {message.jump_url}")
                 hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
 
                 base = f"{message.author.mention} was awarded {points} for"

@@ -1,5 +1,9 @@
+from logging import getLogger
+
 import discord
 from discord.ext import commands
+
+logger = getLogger(__name__)
 
 # NOTE: probably doesn't work if you're replacing *with* a standard emoji (untested)
 to_replace = {
@@ -32,6 +36,9 @@ class FixReacts(commands.Cog):
             message = await channel.fetch_message(payload.message_id)
 
             replaced_emoji = self.bot.get_emoji(to_rep[emoji_id])
+            logger.info(
+                f"Replacing {emoji} with {replaced_emoji} on {message.jump_url}"
+            )
             for reaction in message.reactions:
                 if reaction.emoji == replaced_emoji:
                     if not reaction.normal_count:  # only has super reacts
@@ -48,6 +55,7 @@ class FixReacts(commands.Cog):
             channel = self.bot.get_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
 
+            logger.info(f"Removing my {payload.emoji} on {message.jump_url}")
             await message.remove_reaction(payload.emoji, self.bot.user)
 
 

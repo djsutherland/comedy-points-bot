@@ -1,7 +1,7 @@
-import logging
+from logging import getLogger
 from discord.ext import commands
 
-_log = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
 
 class Basics(commands.Cog):
@@ -30,11 +30,11 @@ class Basics(commands.Cog):
             await self.bot.load_extension(module)
         except Exception as e:
             info = f"{type(e).__name__}: {e}"
-            _log.error(f"Exception in loading {module}\n{info}")
+            logger.error(f"Exception in loading {module}\n{info}")
             await ctx.message.add_reaction("\N{PISTOL}")
             await ctx.send(f"```{info}```")
         else:
-            _log.info(f"Loaded {module}")
+            logger.info(f"Loaded {module}")
             await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
     @commands.command(hidden=True)
@@ -45,11 +45,11 @@ class Basics(commands.Cog):
             await self.bot.unload_extension(module)
         except Exception as e:
             info = f"{type(e).__name__}: {e}"
-            _log.error(f"Exception in unloading {module}\n{info}")
+            logger.error(f"Exception in unloading {module}\n{info}")
             await ctx.message.add_reaction("\N{PISTOL}")
             await ctx.send(f"```{info}```")
         else:
-            _log.info(f"Unloaded {module}")
+            logger.info(f"Unloaded {module}")
             await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
     @commands.command(hidden=True)
@@ -64,11 +64,11 @@ class Basics(commands.Cog):
             await self.bot.load_extension(module)
         except Exception as e:
             info = f"{type(e).__name__}: {e}"
-            _log.error(f"Exception in reloading {module}\n{info}")
+            logger.error(f"Exception in reloading {module}\n{info}")
             await ctx.message.add_reaction("\N{PISTOL}")
             await ctx.send(f"```{info}```")
         else:
-            _log.info(f"Reloaded {module}")
+            logger.info(f"Reloaded {module}")
             await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
     @commands.Cog.listener()
@@ -83,6 +83,7 @@ class Basics(commands.Cog):
 
         channel = self.bot.get_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
+        logger.info(f"Removing {message.jump_url} because of X by {payload.member}")
         await message.delete()
 
 
