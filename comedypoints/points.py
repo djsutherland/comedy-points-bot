@@ -136,11 +136,11 @@ class Points(commands.Cog):
                 logger.info(f"inducting {message.jump_url}")
                 hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
 
-                base = f"{message.author.mention} was awarded {points} for"
+                base = f"was awarded {points} for"
                 if self.channel_is_private(channel):
-                    induction = await hall.send(f"{base} {message.jump_url}.")
+                    induction = await hall.send(f"Someone {base} {message.jump_url}.")
                 else:
-                    induction = await hall.send(f"{base}:")
+                    induction = await hall.send(f"{message.author.mention} {base}:")
                     await message.forward(hall)
 
                 await message.reply(
