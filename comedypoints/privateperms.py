@@ -84,5 +84,6 @@ class PrivatePerms(commands.Cog):
             )
             await message.add_reaction(emoji)
 
+
 async def setup(bot):
     await bot.add_cog(PrivatePerms(bot))

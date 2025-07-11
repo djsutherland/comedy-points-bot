@@ -7,6 +7,7 @@ import random
 from discord.ext import commands
 
 from .utils import LRUCache
+from .privateperms import SETUPS as SUPER_PRIVATES
 
 logger = getLogger(__name__)
 
@@ -136,17 +137,25 @@ class Points(commands.Cog):
                 logger.info(f"inducting {message.jump_url}")
                 hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
 
+                auth = message.author.mention
                 base = f"was awarded {points} for"
-                if self.channel_is_private(channel):
+                if channel.id in SUPER_PRIVATES:
                     induction = await hall.send(f"Someone {base} {message.jump_url}.")
+                elif self.channel_is_private(channel):
+                    induction = await hall.send(f"{auth} {base} {message.jump_url}.")
                 else:
-                    induction = await hall.send(f"{message.author.mention} {base}:")
+                    induction = await hall.send(f"{auth} {base}:")
                     await message.forward(hall)
 
-                await message.reply(
-                    f"{message.author.mention}, you have been awarded {points} "
-                    f"({induction.jump_url})."
-                )
+                try:
+                    await message.reply(
+                        f"{message.author.mention}, you have been awarded {points} "
+                        f"({induction.jump_url})."
+                    )
+                except discord.errors.Forbidden:
+                    logger.exception(
+                        f"Couldn't reply to {message.jump_url}, but it's inducted"
+                    )
 
             await message.add_reaction(payload.emoji)
             self._inducted_cache[payload.message_id] = True
