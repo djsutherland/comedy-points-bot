@@ -50,12 +50,20 @@ class FixReacts(commands.Cog):
         elif emoji_id in been_replaced[payload.guild_id]:
             # someone else is reacting with the replaced emoji
             # if i had that reaction, time to kill it
-            # note: this does *not* error if i didn't have that reaction yet
             channel = self.bot.get_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
 
-            logger.info(f"Removing my {payload.emoji} on {message.jump_url}")
-            await message.remove_reaction(payload.emoji, self.bot.user)
+            emoji = self.bot.get_emoji(emoji_id)
+            for reaction in message.reactions:
+                if reaction.emoji == emoji:
+                    if reaction.me and reaction.normal_count > 1:
+                        logger.info(f"Removing my {emoji} on {message.jump_url}")
+                        await message.remove_reaction(emoji, self.bot.user)
+                    break
+            else: # ...maybe someone reacted then immediately unreacted?
+                logger.warning(
+                    f"Confusing {emoji} status on {message.jump_url}; leaving alone"
+                )
 
 
 async def setup(bot):
