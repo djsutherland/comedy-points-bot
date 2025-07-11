@@ -66,7 +66,7 @@ class PrivatePerms(commands.Cog):
                     user = member
 
             try:
-                logger.warn(f"Trying to add {user}")
+                logger.info(f"Trying to add {user}")
                 await channel.set_permissions(user, view_channel=True)
                 await message.remove_reaction(emoji, user)
             except discord.errors.Forbidden:
