@@ -60,7 +60,7 @@ class FixReacts(commands.Cog):
                         logger.info(f"Removing my {emoji} on {message.jump_url}")
                         await message.remove_reaction(emoji, self.bot.user)
                     break
-            else: # ...maybe someone reacted then immediately unreacted?
+            else:  # ...maybe someone reacted then immediately unreacted?
                 logger.warning(
                     f"Confusing {emoji} status on {message.jump_url}; leaving alone"
                 )

@@ -7,7 +7,9 @@ import random
 from discord.ext import commands
 
 from .utils import LRUCache
-from .privateperms import SETUPS as SUPER_PRIVATES
+from . import privateperms
+
+SUPER_PRIVATES = {channel_id for (emoji, channel_id) in privateperms.SETUPS.values()}
 
 logger = getLogger(__name__)
 
