@@ -12,7 +12,10 @@ class ComedyPointsBot(commands.Bot):
         intents.reactions = True
 
         super().__init__(
-            intents=intents, command_prefix=commands.when_mentioned, **kwargs
+            intents=intents,
+            command_prefix=commands.when_mentioned,
+            strip_after_prefix=True,
+            **kwargs,
         )
         self.initial_extensions = [
             "comedypoints.basics",
