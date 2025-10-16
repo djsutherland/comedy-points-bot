@@ -4,6 +4,7 @@ import datetime
 import itertools
 import random
 
+import discord
 from discord.ext import commands
 
 from .utils import LRUCache
