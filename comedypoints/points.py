@@ -105,7 +105,7 @@ class Points(commands.Cog):
         if message.created_at < START_OF_TIME:
             return
         if message.author == self.bot.user:
-            await message.clear_reaction(VOTING_EMJOI)
+            await message.clear_reaction(VOTING_EMOJI)
             return
 
         for reaction in message.reactions:
