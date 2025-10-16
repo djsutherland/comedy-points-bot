@@ -16,6 +16,7 @@ logger = getLogger(__name__)
 
 START_OF_TIME = datetime.datetime(2025, 7, 1, tzinfo=datetime.timezone.utc)
 VOTING_EMOJI_ID = 748975694540832848
+VOTING_EMOJI = discord.PartialEmoji.from_str(f"ComedyPoints:{VOTING_EMOJI_ID}")
 
 HALLS_OF_FAME = {
     # guild id: channel/thread id
@@ -101,6 +102,9 @@ class Points(commands.Cog):
         guild = message.guild
 
         if message.created_at < START_OF_TIME:
+            return
+        if message.author == self.bot.user:
+            await message.clear_reaction(VOTING_EMJOI)
             return
 
         for reaction in message.reactions:
