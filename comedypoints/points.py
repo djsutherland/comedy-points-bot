@@ -1,3 +1,4 @@
+import asyncio
 from logging import getLogger
 
 import datetime
@@ -73,6 +74,8 @@ PTS_PAIRS = {
 PTS_VALUES = list(PTS_PAIRS.keys())
 PTS_CUM_WTS = list(itertools.accumulate(PTS_PAIRS.values()))
 
+INDUCTION_LOCK = asyncio.Lock()
+
 
 class Points(commands.Cog):
     def __init__(self, bot, cache_size=1024):
@@ -116,56 +119,61 @@ class Points(commands.Cog):
                 f"couldn't find voting reaction on {message.jump_url} "
                 f"even though {payload.user_id} reacted"
             )
-            return  # maybe quickly un-reacted...
+            return  # maybe quickly un-reacted...?
 
-        count = reaction.count
-        voted_for_self = False
-        async for user in reaction.users():
-            if user == self.bot.user:
-                logger.info(f"{message.jump_url} already inducted")
-                # already inducted
-                self._inducted_cache[payload.message_id] = True
-                return
+        with INDUCTION_LOCK:
+            count = reaction.count
+            voted_for_self = False
+            async for user in reaction.users():
+                if user == self.bot.user:
+                    logger.info(f"{message.jump_url} already inducted")
+                    # already inducted
+                    self._inducted_cache[payload.message_id] = True
+                    return
 
-            if user == message.author:
-                voted_for_self = True
-                count -= 1
+                if user == message.author:
+                    voted_for_self = True
+                    count -= 1
 
-        if voted_for_self or (count >= VOTES_THRESH[guild.id]):
-            (points,) = random.choices(PTS_VALUES, cum_weights=PTS_CUM_WTS)
+            if voted_for_self or (count >= VOTES_THRESH[guild.id]):
+                (points,) = random.choices(PTS_VALUES, cum_weights=PTS_CUM_WTS)
 
-            if voted_for_self:
-                logger.info(f"{message.jump_url} getting demerited")
-                await message.reply(
-                    f"{message.author.mention}, "
-                    f"you have been fined {points} for voting for yourself."
-                )
-            else:
-                logger.info(f"inducting {message.jump_url}")
-                hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
-
-                auth = message.author.mention
-                base = f"was awarded {points} for"
-                if channel.id in SUPER_PRIVATES:
-                    induction = await hall.send(f"Someone {base} {message.jump_url}.")
-                elif self.channel_is_private(channel):
-                    induction = await hall.send(f"{auth} {base} {message.jump_url}.")
-                else:
-                    induction = await hall.send(f"{auth} {base}:")
-                    await message.forward(hall)
-
-                try:
+                if voted_for_self:
+                    logger.info(f"{message.jump_url} getting demerited")
                     await message.reply(
-                        f"{message.author.mention}, you have been awarded {points} "
-                        f"({induction.jump_url})."
+                        f"{message.author.mention}, "
+                        f"you have been fined {points} for voting for yourself."
                     )
-                except discord.errors.Forbidden:
-                    logger.exception(
-                        f"Couldn't reply to {message.jump_url}, but it's inducted"
-                    )
+                else:
+                    logger.info(f"inducting {message.jump_url}")
+                    hall = guild.get_channel_or_thread(HALLS_OF_FAME[guild.id])
 
-            await message.add_reaction(payload.emoji)
-            self._inducted_cache[payload.message_id] = True
+                    auth = message.author.mention
+                    base = f"was awarded {points} for"
+                    if channel.id in SUPER_PRIVATES:
+                        induction = await hall.send(
+                            f"Someone {base} {message.jump_url}."
+                        )
+                    elif self.channel_is_private(channel):
+                        induction = await hall.send(
+                            f"{auth} {base} {message.jump_url}."
+                        )
+                    else:
+                        induction = await hall.send(f"{auth} {base}:")
+                        await message.forward(hall)
+
+                    try:
+                        await message.reply(
+                            f"{message.author.mention}, you have been awarded {points} "
+                            f"({induction.jump_url})."
+                        )
+                    except discord.errors.Forbidden:
+                        logger.exception(
+                            f"Couldn't reply to {message.jump_url}, but it's inducted"
+                        )
+
+                await message.add_reaction(payload.emoji)
+                self._inducted_cache[payload.message_id] = True
 
 
 async def setup(bot):
