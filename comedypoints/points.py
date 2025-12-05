@@ -121,7 +121,7 @@ class Points(commands.Cog):
             )
             return  # maybe quickly un-reacted...?
 
-        with INDUCTION_LOCK:
+        async with INDUCTION_LOCK:
             count = reaction.normal_count + 2 * reaction.burst_count
             voted_for_self = False
             async for user in reaction.users():
