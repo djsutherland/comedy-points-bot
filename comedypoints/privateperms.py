@@ -8,12 +8,11 @@ from discord.ext import commands
 
 logger = getLogger(__name__)
 
-bulba = discord.PartialEmoji.from_str("")
 PANEL_TEXT = (
     "You’re welcome to join our private trans & non-binary channel by clicking join below. "
     "<:transbulba:665751401477046302> "
     "It's a private space for trans, enby, gender non-conforming, and questioning people to chat. "
-    "Joining is fully confidential; other members won’t be able to see that you’re there.
+    "Joining is fully confidential; other members won’t be able to see that you’re there."
 )
 
 
