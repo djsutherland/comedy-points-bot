@@ -11,7 +11,7 @@ from discord.ext import commands
 from .utils import LRUCache
 from . import privateperms
 
-SUPER_PRIVATES = {channel_id for (emoji, channel_id) in privateperms.SETUPS.values()}
+SUPER_PRIVATES = {setup.target_channel_id for setup in privateperms.SETUPS}
 
 logger = getLogger(__name__)
 
