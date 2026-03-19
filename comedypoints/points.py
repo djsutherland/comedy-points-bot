@@ -122,12 +122,14 @@ class Points(commands.Cog):
             return  # maybe quickly un-reacted...?
 
         async with INDUCTION_LOCK:
+            if payload.message_id in self._inducted_cache:
+                return  # another coro probably just inducted it
+
             count = reaction.normal_count + 2 * reaction.burst_count
             voted_for_self = False
             async for user in reaction.users():
                 if user == self.bot.user:
                     logger.info(f"{message.jump_url} already inducted")
-                    # already inducted
                     self._inducted_cache[payload.message_id] = True
                     return
 
@@ -162,6 +164,11 @@ class Points(commands.Cog):
                         induction = await hall.send(f"{auth} {base}:")
                         await message.forward(hall)
 
+                await message.add_reaction(payload.emoji)
+                self._inducted_cache[payload.message_id] = True
+
+                if not voted_for_self:
+                    # do this after making induction "official"
                     try:
                         await message.reply(
                             f"{message.author.mention}, you have been awarded {points} "
@@ -172,8 +179,6 @@ class Points(commands.Cog):
                             f"Couldn't reply to {message.jump_url}, but it's inducted"
                         )
 
-                await message.add_reaction(payload.emoji)
-                self._inducted_cache[payload.message_id] = True
 
 
 async def setup(bot):
