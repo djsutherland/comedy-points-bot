@@ -10,9 +10,10 @@ logger = getLogger(__name__)
 
 bulba = discord.PartialEmoji.from_str("")
 PANEL_TEXT = (
-    f"If you're trans/nonbinary/etc and would like to opt in to <:transbulba:665751401477046302> "
-    "in a private channel, press the Join button below. People not in the channel "
-    "won't see that that you're in there."
+    "You’re welcome to join our private trans & non-binary channel by clicking join below. "
+    "<:transbulba:665751401477046302> "
+    "It's a private space for trans, enby, gender non-conforming, and questioning people to chat. "
+    "Joining is fully confidential; other members won’t be able to see that you’re there.
 )
 
 
@@ -33,7 +34,7 @@ class PrivatePermsConfig:
 SETUPS = (
     PrivatePermsConfig(  # blankies #come-iiiin and #da-gendersh
         panel_channel_id=647968771494903818,
-        target_channel_id=647968771494903818,
+        target_channel_id=795433326802108456,
     ),
     # PrivatePermsConfig(  # dani #bot-testing and #secret-place
     #     panel_channel_id=1198483653941006428,
