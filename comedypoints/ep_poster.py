@@ -37,10 +37,10 @@ from reader import make_reader, ReaderError
 logger = getLogger(__name__)
 
 FEEDS = {
-    os.environ.get("PATREON_RSS", "https://feeds.megaphone.fm/blank-check.xml"),
-    "https://feeds.megaphone.fm/THI7214278819.xml",  # critical darlings
+    os.environ.get("PATREON_RSS", "https://feeds.megaphone.fm/blank-check"),
+    "https://feeds.megaphone.fm/THI7214278819",  # critical darlings
 }
-READER_DB_PATH = os.environ.get("READER_DB", str(Path(__file__).parent.parent / "db.sqlite"))
+READER_DB_PATH = os.environ.get("READER_DB", str(Path(__file__).parent.parent / "rss-db.sqlite"))
 
 if os.environ.get("DEV_MODE"):
     TARGET_CHANNEL = 1198483653941006428  # dani #bot-testing
@@ -53,8 +53,7 @@ START_OF_TIME = datetime.datetime(2026, 3, 12, tzinfo=datetime.timezone.utc)
 async def run_in_thread(func, *args, default=None, **kwargs):
     """Runs a blocking reader task in a separate thread."""
     try:
-        return func(*args, **kwargs)
-        #return await asyncio.to_thread(func, *args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
     except ReaderError as error:
         logger.error("Error executing task: %s", error)
         return default
@@ -67,6 +66,11 @@ class EpPoster(commands.Cog):
         logger.info("Initializing RSS reader")
         self.reader = make_reader(READER_DB_PATH)
         self.reader.set_tag((), ".reader.update", {"interval": 6, "jitter": 0.8})
+
+        # make sure the reader lazy-init is done
+        parser = getattr(self.reader, "_parser", None)
+        if hasattr(parser, "_lazy_init"):
+            parser._lazy_init()
 
     async def cog_load(self):
         await asyncio.gather(

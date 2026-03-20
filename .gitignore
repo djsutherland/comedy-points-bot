@@ -1,5 +1,4 @@
-/db.sqlite
-/db.sqlite.search
+/rss-db.sqlite*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
