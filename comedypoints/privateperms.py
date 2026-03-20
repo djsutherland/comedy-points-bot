@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 from logging import getLogger
+import os
 from typing import Set
 
 import discord
@@ -30,16 +31,20 @@ class PrivatePermsConfig:
         return f"privateperms:leave:{self.target_channel_id}"
 
 
-SETUPS = (
-    PrivatePermsConfig(  # blankies #come-iiiin and #da-gendersh
-        panel_channel_id=647968771494903818,
-        target_channel_id=795433326802108456,
-    ),
-    # PrivatePermsConfig(  # dani #bot-testing and #secret-place
-    #     panel_channel_id=1198483653941006428,
-    #     target_channel_id=1392342773440712756,
-    # ),
-)
+if os.environ.get("DEV_MODE"):
+    SETUPS = [
+        PrivatePermsConfig(  # dani #bot-testing and #secret-place
+            panel_channel_id=1198483653941006428,
+            target_channel_id=1392342773440712756,
+        )
+    ]
+else:
+    SETUPS = [
+        PrivatePermsConfig(  # blankies #come-iiiin and #da-gendersh
+            panel_channel_id=647968771494903818,
+            target_channel_id=795433326802108456,
+        ),
+    ]
 
 
 class PrivatePermsJoinButton(discord.ui.Button):

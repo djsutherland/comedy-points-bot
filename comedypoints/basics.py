@@ -5,7 +5,9 @@ from discord.ext import commands
 
 logger = getLogger(__name__)
 
-msg_format = re.compile(r'https?://discord\.com/channels/\d+/(?P<channel>\d+)/(?P<message>\d+)/?$')
+msg_format = re.compile(
+    r"https?://discord\.com/channels/\d+/(?P<channel>\d+)/(?P<message>\d+)/?$"
+)
 
 
 class Basics(commands.Cog):
@@ -97,11 +99,13 @@ class Basics(commands.Cog):
         if not m:
             return await ctx.reply("Incorrect message link, dummy")
 
-        channel = self.bot.get_channel(int(m.group('channel')))
+        channel = self.bot.get_channel(int(m.group("channel")))
         try:
-            message = await channel.fetch_message(int(m.group('message')))
+            message = await channel.fetch_message(int(m.group("message")))
         except discord.NotFound:
-            return await ctx.reply("Couldn't find this post; this doesn't work in threads yet")
+            return await ctx.reply(
+                "Couldn't find this post; this doesn't work in threads yet"
+            )
 
         if message.author.id != self.bot.user.id:
             return await ctx.reply(f"Not deleting a post by {message.author}")
@@ -109,6 +113,7 @@ class Basics(commands.Cog):
         logger.info(f"Removing {message.jump_url} because of command by {ctx.author}")
         await message.delete()
         await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
+
 
 async def setup(bot):
     await bot.add_cog(Basics(bot))
