@@ -14,6 +14,7 @@ def main():
     load_dotenv()
     discord.utils.setup_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
     discord.VoiceClient.warn_nacl = False
+    discord.VoiceClient.warn_dave = False
 
     if "DM_LOG_TARGET" in os.environ:
         logger = logging.getLogger()
