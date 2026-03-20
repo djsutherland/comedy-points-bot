@@ -52,7 +52,8 @@ if os.environ.get("DEV_MODE"):
     TARGET_CHANNEL = 1198483653941006428  # dani #bot-testing
     TARGET_ROLE = 1484422590885007430
 else:
-    TARGET_CHANNEL = 755516308355022970  # blankies #bot-testing-ground
+    #TARGET_CHANNEL = 755516308355022970  # blankies #bot-testing-ground
+    TARGET_CHANNEL = 829052560085352458  # blankies #blank-check-podcast
     TARGET_ROLE = 795408027883929601
 
 START_OF_TIME = datetime.datetime(2026, 3, 16, tzinfo=datetime.timezone.utc)
