@@ -563,7 +563,7 @@ class EpPoster(commands.Cog):
 
         view = await self._build_episode_card(entry)
         msg = await channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
-        await msg.reply(role.mention)
+        await msg.reply(role.mention, allowed_mentions=discord.AllowedMentions.all())
         await run_in_thread(self.reader.mark_entry_as_read, entry)
 
 
