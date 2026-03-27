@@ -44,7 +44,7 @@ logger = getLogger(__name__)
 
 FEEDS = {
     os.environ.get("PATREON_RSS", "https://feeds.megaphone.fm/blank-check"),
-    "https://feeds.megaphone.fm/THI7214278819",  # critical darlings
+    # "https://feeds.megaphone.fm/THI7214278819",  # critical darlings
 }
 READER_DB_PATH = os.environ.get("READER_DB", str(Path(__file__).parent.parent / "rss-db.sqlite"))
 
