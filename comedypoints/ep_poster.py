@@ -35,6 +35,7 @@ from pathlib import Path
 import re
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
@@ -46,33 +47,33 @@ FEEDS = {
     os.environ.get("PATREON_RSS", "https://feeds.megaphone.fm/blank-check"),
     # "https://feeds.megaphone.fm/THI7214278819",  # critical darlings
 }
-READER_DB_PATH = os.environ.get("READER_DB", str(Path(__file__).parent.parent / "rss-db.sqlite"))
+READER_DB_PATH = os.environ.get(
+    "READER_DB", str(Path(__file__).parent.parent / "rss-db.sqlite")
+)
 
 if os.environ.get("DEV_MODE"):
     TARGET_CHANNEL = 1198483653941006428  # dani #bot-testing
     TARGET_ROLE = 1484422590885007430
 else:
-    #TARGET_CHANNEL = 755516308355022970  # blankies #bot-testing-ground
+    # TARGET_CHANNEL = 755516308355022970  # blankies #bot-testing-ground
     TARGET_CHANNEL = 829052560085352458  # blankies #blank-check-podcast
     TARGET_ROLE = 795408027883929601
 
 START_OF_TIME = datetime.datetime(2026, 3, 16, tzinfo=datetime.timezone.utc)
 ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
-SUMMARY_LIMIT = 900
-SUMMARY_PARAGRAPH_LIMIT = 2
 FEED_FETCH_TIMEOUT = 15
-SUMMARY_TRIM_MARKERS = (
-    "Learn more about your ad choices.",
-    "Apple Podcasts:",
-    "Sign up for Check Book",
-    "Join our Patreon",
-    "Follow us @",
-    "Buy some real nerdy merch",
-    "Connect with other Blankies",
-    "Subscribe to ",
-    "Read ",
-)
+
+NY = ZoneInfo("America/New_York")
+UPDATE_TIMES = [
+    datetime.time(hour=0, minute=m, second=s, tzinfo=NY)
+    for m in [0, 1, 2, 3]
+    for s in [2, 17, 32, 47]
+] + [
+    datetime.time(hour=h, minute=m, second=47, tzinfo=NY)
+    for h in range(24)
+    for m in range(4, 59, 5)
+]
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,194 @@ class FeedMetadata:
     link: str | None = None
     image_url: str | None = None
     items: tuple[FeedItemMetadata, ...] = field(default_factory=tuple)
+
+
+async def run_in_thread(func, *args, default=None, **kwargs):
+    """Runs a blocking reader task in a separate thread."""
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    except ReaderError as error:
+        logger.error("Error executing task: %s", error)
+        return default
+
+
+class EpPoster(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self._feed_cache = {}
+        self._feed_cache_locks = {}
+        self._update_lock = asyncio.Lock()
+
+        logger.info("Initializing RSS reader")
+        self.reader = make_reader(READER_DB_PATH)
+        # self.reader.set_tag((), ".reader.update", {"interval": 6, "jitter": 0.8})
+
+        # make sure the reader lazy-init is done
+        parser = getattr(self.reader, "_parser", None)
+        getattr(parser, "_lazy_init", lambda: None)()
+
+    async def cog_load(self):
+        await asyncio.gather(
+            *[run_in_thread(self.reader.add_feed, url, exist_ok=True) for url in FEEDS]
+        )
+        curr = {feed.url for feed in self.reader.get_feeds()}
+        if to_del := curr - FEEDS:
+            await asyncio.gather(
+                *[run_in_thread(self.reader.delete_feed, url) for url in to_del]
+            )
+        self.check_feeds.start()
+        self.clear_feed_caches.start()
+
+    async def cog_unload(self):
+        self.check_feeds.cancel()
+        self.clear_feed_caches.cancel()
+
+    @tasks.loop(hours=24)
+    async def clear_feed_caches(self):
+        self._feed_cache.clear()
+
+    @tasks.loop(time=UPDATE_TIMES)
+    async def check_feeds(self):
+        async with self._update_lock:
+            # don't use reader's timing mechanism, use ours
+            await run_in_thread(self.reader.update_feeds, scheduled=False)
+
+            async with asyncio.TaskGroup() as tg:
+                posted = 0
+                for entry in self.reader.get_entries(read=False):
+                    if (
+                        not entry.published or entry.published > START_OF_TIME
+                    ) and posted <= 3:
+                        tg.create_task(self.post_entry(entry))
+                        posted += 1
+                    else:
+                        tg.create_task(run_in_thread(self.reader.mark_entry_as_read, entry))
+
+    async def _get_feed_metadata(self, feed_url: str) -> FeedMetadata:
+        if cached := self._feed_cache.get(feed_url):
+            return cached
+
+        lock = self._feed_cache_locks.setdefault(feed_url, asyncio.Lock())
+        async with lock:
+            if cached := self._feed_cache.get(feed_url):
+                return cached
+
+            try:
+                metadata = await asyncio.to_thread(_fetch_feed_metadata, feed_url)
+            except Exception:
+                logger.warning(
+                    "Failed to fetch feed metadata for %s", feed_url, exc_info=True
+                )
+                metadata = FeedMetadata()
+
+            self._feed_cache[feed_url] = metadata
+            return metadata
+
+    async def post_entry(self, entry):
+        channel = self.bot.get_channel(TARGET_CHANNEL) or (
+            await self.bot.fetch_channel(TARGET_CHANNEL)
+        )  # should only need to fetch at most once
+        guild = channel.guild
+        role = guild.get_role(TARGET_ROLE) or (await guild.fetch_role(TARGET_ROLE))
+
+        view = await self._build_episode_card(entry)
+        msg = await channel.send(
+            view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
+        await msg.reply(role.mention, allowed_mentions=discord.AllowedMentions.all())
+        await run_in_thread(self.reader.mark_entry_as_read, entry)
+
+    async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata]:
+        feed_metadata = await self._get_feed_metadata(entry.feed_url)
+        item_metadata = next(
+            (
+                item
+                for item in feed_metadata.items
+                if _feed_item_matches_entry(item, entry)
+            ),
+            FeedItemMetadata("[unknown]"),
+        )
+        return feed_metadata, item_metadata
+
+    async def _build_episode_card(self, entry) -> discord.ui.LayoutView:
+        feed_metadata, item_metadata = await self._get_item_metadata(entry)
+        view = discord.ui.LayoutView(timeout=None)
+
+        feed_title = _escape_display_text(
+            entry.feed_resolved_title or feed_metadata.title
+        )
+        title = _escape_display_text(_truncate_text(entry.title or "New episode", 300))
+        summary = _escape_display_text(
+            _build_summary(_preferred_summary_source(entry, item_metadata))
+        )
+
+        metadata_bits = []
+        if item_metadata.episode_type and item_metadata.episode_type.title() != "Full":
+            metadata_bits.append(item_metadata.episode_type.title())
+        if duration := _format_duration(item_metadata.duration_seconds):
+            metadata_bits.append(duration)
+        if published := _format_timestamp(entry.published):
+            metadata_bits.append(published)
+
+        metadata_lines = []
+        if metadata_bits:
+            metadata_lines.append(f"-# {' • '.join(metadata_bits)}")
+        metadata_line = "\n".join(metadata_lines) if metadata_lines else None
+
+        card = discord.ui.Container(accent_color=discord.Color.blurple())
+
+        if feed_title:
+            card.add_item(discord.ui.TextDisplay(f"-# {feed_title}"))
+
+        body_children = [f"## {title}"]
+        if summary:
+            body_children.append(summary)
+        if metadata_line:
+            body_children.append(metadata_line)
+
+        primary_url = entry.link or item_metadata.link
+        audio_url = next(
+            (enclosure.href for enclosure in entry.enclosures if enclosure.href), None
+        )
+        image_url = item_metadata.image_url or feed_metadata.image_url
+
+        if image_url:
+            body_section = discord.ui.Section(
+                *body_children,
+                accessory=discord.ui.Thumbnail(
+                    image_url,
+                    description=entry.title or "Episode art",
+                ),
+            )
+            card.add_item(body_section)
+        else:
+            for child in body_children:
+                card.add_item(discord.ui.TextDisplay(child))
+
+        view.add_item(card)
+        return view
+
+
+async def setup(bot):
+    await bot.add_cog(EpPoster(bot))
+
+
+################################################################################
+# Formatting helpers
+
+SUMMARY_LIMIT = 900
+SUMMARY_PARAGRAPH_LIMIT = 2
+SUMMARY_TRIM_MARKERS = (
+    "Learn more about your ad choices.",
+    "Apple Podcasts:",
+    "Sign up for Check Book",
+    "Join our Patreon",
+    "Follow us @",
+    "Buy some real nerdy merch",
+    "Connect with other Blankies",
+    "Subscribe to ",
+    "Read ",
+)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -134,15 +323,6 @@ class _HTMLTextExtractor(HTMLParser):
         return "".join(self.parts)
 
 
-async def run_in_thread(func, *args, default=None, **kwargs):
-    """Runs a blocking reader task in a separate thread."""
-    try:
-        return await asyncio.to_thread(func, *args, **kwargs)
-    except ReaderError as error:
-        logger.error("Error executing task: %s", error)
-        return default
-
-
 def _normalize_whitespace(text: str | None) -> str | None:
     if not text:
         return None
@@ -176,8 +356,8 @@ def _element_markup(parent: ET.Element | None, path: str) -> str | None:
 
 def _first_nonempty(*values: str | None) -> str | None:
     for value in values:
-        if value and value.strip():
-            return value.strip()
+        if value and (s := value.strip()):
+            return s
     return None
 
 
@@ -223,8 +403,8 @@ def _format_duration(seconds: int | None) -> str | None:
     if seconds is None:
         return None
 
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    hours, minsecs = divmod(seconds, 3600)
+    minutes, seconds = divmod(minsecs, 60)
 
     parts = []
     if hours:
@@ -276,7 +456,11 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
 
-    sentence_cut = max(text.rfind(". ", 0, limit), text.rfind("! ", 0, limit), text.rfind("? ", 0, limit))
+    sentence_cut = max(
+        text.rfind(". ", 0, limit),
+        text.rfind("! ", 0, limit),
+        text.rfind("? ", 0, limit),
+    )
     if sentence_cut >= limit // 2:
         return text[: sentence_cut + 1].rstrip() + "..."
 
@@ -289,9 +473,7 @@ def _truncate_text(text: str, limit: int) -> str:
 
 def _trim_summary_boilerplate(text: str) -> str:
     cut_points = [
-        text.find(marker)
-        for marker in SUMMARY_TRIM_MARKERS
-        if text.find(marker) >= 120
+        text.find(marker) for marker in SUMMARY_TRIM_MARKERS if text.find(marker) >= 120
     ]
     if cut_points:
         return text[: min(cut_points)].rstrip()
@@ -338,32 +520,24 @@ def _format_timestamp(timestamp: datetime.datetime | None) -> str | None:
 
 
 def _feed_item_matches_entry(item: FeedItemMetadata, entry) -> bool:
-    entry_values = {
-        value
-        for value in (
-            _normalize_whitespace(entry.id),
-            _normalize_whitespace(entry.link),
-            _normalize_whitespace(entry.title),
-        )
-        if value
-    }
-    item_values = {
-        value
-        for value in (
-            _normalize_whitespace(item.id),
-            _normalize_whitespace(item.link),
-            _normalize_whitespace(item.title),
-        )
-        if value
-    }
-    return bool(entry_values & item_values)
+    def values(x):
+        return {
+            _normalize_whitespace(getattr(x, n)) or None
+            for n in ["id", "link", "title"]
+        } - {None}
+
+    return bool(values(item) & values(entry))
 
 
-def _preferred_summary_source(entry, item_metadata: FeedItemMetadata | None) -> str | None:
+def _preferred_summary_source(
+    entry, item_metadata: FeedItemMetadata | None
+) -> str | None:
     if item_metadata and item_metadata.content_html:
         return item_metadata.content_html
 
-    entry_html = next((content.value for content in entry.content if content.is_html), None)
+    entry_html = next(
+        (content.value for content in entry.content if content.is_html), None
+    )
     if entry_html:
         return entry_html
 
@@ -373,7 +547,9 @@ def _preferred_summary_source(entry, item_metadata: FeedItemMetadata | None) -> 
     if entry.summary:
         return entry.summary
 
-    entry_text = next((content.value for content in entry.content if content.value), None)
+    entry_text = next(
+        (content.value for content in entry.content if content.value), None
+    )
     return entry_text
 
 
@@ -426,146 +602,3 @@ def _fetch_feed_metadata(feed_url: str) -> FeedMetadata:
         image_url=feed_image,
         items=tuple(items),
     )
-
-
-class EpPoster(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self._feed_cache = {}
-        self._feed_cache_locks = {}
-
-        logger.info("Initializing RSS reader")
-        self.reader = make_reader(READER_DB_PATH)
-        self.reader.set_tag((), ".reader.update", {"interval": 6, "jitter": 0.8})
-
-        # make sure the reader lazy-init is done
-        parser = getattr(self.reader, "_parser", None)
-        if hasattr(parser, "_lazy_init"):
-            parser._lazy_init()
-
-    async def cog_load(self):
-        await asyncio.gather(
-            *[run_in_thread(self.reader.add_feed, url, exist_ok=True) for url in FEEDS]
-        )
-        curr = await run_in_thread(
-            lambda: {feed.url for feed in self.reader.get_feeds()}
-        )
-        if to_del := curr - FEEDS:
-            await asyncio.gather(
-                *[run_in_thread(self.reader.delete_feed, url) for url in to_del]
-            )
-        self.check_feeds.start()
-
-    async def cog_unload(self):
-        self.check_feeds.cancel()
-
-    @tasks.loop(minutes=2)
-    async def check_feeds(self):
-        logger.info("Running RSS updates")
-        await run_in_thread(self.reader.update_feeds, scheduled=True)
-        self._feed_cache.clear()
-
-        async with asyncio.TaskGroup() as tg:
-            posted = 0
-            for entry in self.reader.get_entries(read=False):
-                if (not entry.published or entry.published > START_OF_TIME) and posted <= 3:
-                    tg.create_task(self.post_entry(entry))
-                    posted += 1
-                else:
-                    tg.create_task(run_in_thread(self.reader.mark_entry_as_read, entry))
-
-    async def _get_feed_metadata(self, feed_url: str) -> FeedMetadata:
-        if cached := self._feed_cache.get(feed_url):
-            return cached
-
-        lock = self._feed_cache_locks.setdefault(feed_url, asyncio.Lock())
-        async with lock:
-            if cached := self._feed_cache.get(feed_url):
-                return cached
-
-            try:
-                metadata = await asyncio.to_thread(_fetch_feed_metadata, feed_url)
-            except Exception:
-                logger.warning("Failed to fetch feed metadata for %s", feed_url, exc_info=True)
-                metadata = FeedMetadata()
-
-            self._feed_cache[feed_url] = metadata
-            return metadata
-
-    async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata | None]:
-        feed_metadata = await self._get_feed_metadata(entry.feed_url)
-        item_metadata = next(
-            (item for item in feed_metadata.items if _feed_item_matches_entry(item, entry)),
-            None,
-        )
-        return feed_metadata, item_metadata
-
-    async def _build_episode_card(self, entry) -> discord.ui.LayoutView:
-        feed_metadata, item_metadata = await self._get_item_metadata(entry)
-        view = discord.ui.LayoutView(timeout=None)
-
-        feed_title = _escape_display_text(entry.feed_resolved_title or feed_metadata.title)
-        title = _escape_display_text(_truncate_text(entry.title or "New episode", 300))
-        summary = _escape_display_text(_build_summary(_preferred_summary_source(entry, item_metadata)))
-
-        metadata_bits = []
-        if item_metadata and item_metadata.episode_type and item_metadata.episode_type.title() != "Full":
-            metadata_bits.append(item_metadata.episode_type.title())
-        if duration := _format_duration(item_metadata.duration_seconds if item_metadata else None):
-            metadata_bits.append(duration)
-        if published := _format_timestamp(entry.published):
-            metadata_bits.append(published)
-
-        metadata_lines = []
-        if metadata_bits:
-            metadata_lines.append(f"-# {' • '.join(metadata_bits)}")
-        metadata_line = "\n".join(metadata_lines) if metadata_lines else None
-
-        card = discord.ui.Container(accent_color=discord.Color.blurple())
-
-        if feed_title:
-            card.add_item(discord.ui.TextDisplay(f"-# {feed_title}"))
-
-        body_children = [f"## {title}"]
-        if summary:
-            body_children.append(summary)
-        if metadata_line:
-            body_children.append(metadata_line)
-
-        primary_url = entry.link or (item_metadata.link if item_metadata else None)
-        audio_url = next((enclosure.href for enclosure in entry.enclosures if enclosure.href), None)
-        image_url = (
-            item_metadata.image_url if item_metadata else None
-        ) or feed_metadata.image_url
-
-        if image_url:
-            body_section = discord.ui.Section(
-                *body_children,
-                accessory=discord.ui.Thumbnail(
-                    image_url,
-                    description=entry.title or "Episode art",
-                ),
-            )
-            card.add_item(body_section)
-        else:
-            for child in body_children:
-                card.add_item(discord.ui.TextDisplay(child))
-
-        view.add_item(card)
-        return view
-
-    async def post_entry(self, entry):
-        channel = self.bot.get_channel(TARGET_CHANNEL) or (
-            await self.bot.fetch_channel(TARGET_CHANNEL)
-        )  # should only need to fetch at most once
-        guild = channel.guild
-        role = guild.get_role(TARGET_ROLE) or (await guild.fetch_role(TARGET_ROLE))
-
-        view = await self._build_episode_card(entry)
-        msg = await channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
-        await msg.reply(role.mention, allowed_mentions=discord.AllowedMentions.all())
-        await run_in_thread(self.reader.mark_entry_as_read, entry)
-
-
-async def setup(bot):
-    await bot.add_cog(EpPoster(bot))
