@@ -161,7 +161,9 @@ class EpPoster(commands.Cog):
                         tg.create_task(self.post_entry(entry))
                         posted += 1
                     else:
-                        tg.create_task(run_in_thread(self.reader.mark_entry_as_read, entry))
+                        tg.create_task(
+                            run_in_thread(self.reader.mark_entry_as_read, entry)
+                        )
 
     async def _get_feed_metadata(self, feed_url: str) -> FeedMetadata:
         if cached := self._feed_cache.get(feed_url):
@@ -194,7 +196,7 @@ class EpPoster(commands.Cog):
         msg = await channel.send(
             view=view, allowed_mentions=discord.AllowedMentions.none()
         )
-        await msg.reply(role.mention, allowed_mentions=discord.AllowedMentions.all())
+        await channel.send(role.mention, allowed_mentions=discord.AllowedMentions.all())
         await run_in_thread(self.reader.mark_entry_as_read, entry)
 
     async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata]:
