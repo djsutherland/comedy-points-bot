@@ -141,6 +141,11 @@ class EpPoster(commands.Cog):
     async def clear_feed_caches(self):
         self._feed_cache.clear()
 
+    @commands.command("rss", hidden=True)
+    async def _do_rss(self, ctx):
+        await self.check_feeds()
+        await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
+
     @tasks.loop(time=UPDATE_TIMES)
     async def check_feeds(self):
         async with self._update_lock:
