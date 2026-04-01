@@ -67,12 +67,12 @@ FEED_FETCH_TIMEOUT = 15
 NY = ZoneInfo("America/New_York")
 UPDATE_TIMES = [
     datetime.time(hour=0, minute=m, second=s, tzinfo=NY)
-    for m in [0, 1, 2, 3]
-    for s in [2, 17, 32, 47]
+    for m in [0, 1]
+    for s in [2, 17, 36, 48]
 ] + [
     datetime.time(hour=h, minute=m, second=47, tzinfo=NY)
     for h in range(24)
-    for m in range(4, 59, 5)
+    for m in range(3, 60, 5)
 ]
 
 
