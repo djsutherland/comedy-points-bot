@@ -31,6 +31,8 @@ class TextReacts(commands.Cog):
         content = message.content.strip()
         if (sticker_id := STICKER_MAP.get(content)):
             sticker = self.bot.get_sticker(sticker_id)
+            if sticker is None:
+                sticker = await self.bot.fetch_sticker(sticker_id)
             await message.channel.send(stickers=[sticker])
 
 
