@@ -12,8 +12,10 @@ UTC = datetime.timezone.utc
 
 if os.environ.get("DEV_MODE"):
     STICKER_MAP = {"careful": 1417923796257738835}
+    TEXT_MAP = {"true": "true!"}
 else:
     STICKER_MAP = {"good": 1026120666182844536, "good.": 1026120666182844536}
+    TEXT_MAP = {"true": "<:ella_mctrue:1487096323814457344>"}
 
 
 class TextReacts(commands.Cog):
@@ -36,6 +38,10 @@ class TextReacts(commands.Cog):
             if sticker is None:
                 sticker = await self.bot.fetch_sticker(sticker_id)
             await message.channel.send(stickers=[sticker])
+
+        elif (resp := TEXT_MAP.get(content)) is not None:
+            logger.info(f"{message.jump_url} said {content}")
+            await message.channel.send(resp)
 
 
 async def setup(bot):
