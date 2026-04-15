@@ -25,8 +25,10 @@ class TextReacts(commands.Cog):
         if message.author == self.bot.user:
             return
 
-        # not going to bother with storing which have been reacted to because of this
-        if datetime.datetime.now(datetime.UTC) - message.created_at > RECENCY_THRESH:
+        # not going to bother with storing which have been reacted to:
+        lapsed = datetime.datetime.now(datetime.UTC) - message.created_at
+        if lapsed > RECENCY_THRESH:
+            logger.info(f"too slow on {message.jump_url}: {lapsed}")
             return  # missed our chance
 
         content = message.content.strip()
