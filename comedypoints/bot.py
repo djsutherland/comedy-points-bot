@@ -24,6 +24,7 @@ class ComedyPointsBot(commands.Bot):
             "comedypoints.points",
             "comedypoints.privateperms",
             "comedypoints.ep_poster",
+            "comedypoints.text_reacts",
         ]
 
     async def setup_hook(self):
