@@ -15,7 +15,10 @@ if os.environ.get("DEV_MODE"):
     TEXT_MAP = {"true": "true!"}
 else:
     STICKER_MAP = {"good": 1026120666182844536, "good.": 1026120666182844536}
-    TEXT_MAP = {"true": "<:ella_mctrue:1487096323814457344>"}
+    TEXT_MAP = {
+        "true": "<:ella_mctrue:1487096323814457344>",
+        "oh no": "<:ohno:691806339629973594>",
+    }
 
 
 class TextReacts(commands.Cog):
