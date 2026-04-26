@@ -230,6 +230,7 @@ class EpPoster(commands.Cog):
             metadata_bits.append(duration)
         if published := _format_timestamp(entry.published):
             metadata_bits.append(published)
+        metadata_bits.append("Posted by: Andy")
 
         metadata_lines = []
         if metadata_bits:
