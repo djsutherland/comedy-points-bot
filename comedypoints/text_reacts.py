@@ -17,6 +17,8 @@ else:
     STICKER_MAP = {"good": 1026120666182844536, "good.": 1026120666182844536}
     TEXT_MAP = {
         "true": "<:ella_mctrue:1487096323814457344>",
+        "true.": "<:ella_mctrue:1487096323814457344>",
+        "true...": "<:ella_mctrue:1487096323814457344>",
         "oh no": "<:ohno:691806339629973594>",
     }
 
@@ -36,7 +38,7 @@ class TextReacts(commands.Cog):
             logger.info(f"too slow on {message.jump_url}: {lapsed}")
             return  # missed our chance
 
-        content = message.content.strip()
+        content = message.content.strip().lower()
         if (sticker_id := STICKER_MAP.get(content)) is not None:
             logger.info(f"{message.jump_url} said {content}")
             sticker = self.bot.get_sticker(sticker_id)
