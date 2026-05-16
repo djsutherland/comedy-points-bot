@@ -16,14 +16,14 @@ if os.environ.get("DEV_MODE"):
 else:
     STICKER_MAP = {"good": 1026120666182844536, "good.": 1026120666182844536}
     TEXT_MAP = {
-        "true": "<:ella_mctrue:1487096323814457344>",
-        "true.": "<:ella_mctrue:1487096323814457344>",
-        "true...": "<:ella_mctrue:1487096323814457344>",
-        "oh no": "<:ohno:691806339629973594>",
-        "oh no!": "<:ohno:691806339629973594>",
-        "uh oh": "<:waltongoggins:1499118573686358096>",
-        "uhoh": "<:waltongoggins:1499118573686358096>",
-        "uh-oh": "<:waltongoggins:1499118573686358096>",
+        "true": (_true := "<:ella_mctrue:1487096323814457344>"),
+        "true.": _true,
+        "true...": _true,
+        "oh no": (_ohno := "<:ohno:691806339629973594>"),
+        "oh no!": _ohno,
+        "uh oh": (_uhoh := "<:waltongoggins:755182779473592420>"),
+        "uhoh": _uhoh,
+        "uh-oh": _uhoh,
     }
 
 
