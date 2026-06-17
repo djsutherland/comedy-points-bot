@@ -92,6 +92,37 @@ class Points(commands.Cog):
         self._channel_is_private[channel] = result
         return result
 
+    def cached_message(self, message_id):
+        return discord.utils.get(self.bot.cached_messages, id=message_id)
+
+    def voting_reaction(self, message):
+        for reaction in message.reactions:
+            if getattr(reaction.emoji, "id", 0) == VOTING_EMOJI_ID:
+                return reaction
+        return None
+
+    def reaction_vote_count(self, reaction):
+        return reaction.normal_count + 2 * reaction.burst_count
+
+    def payload_vote_weight(self, payload):
+        return 2 if getattr(payload, "burst", False) else 1
+
+    def cached_vote_is_below_threshold(self, payload, message):
+        if message.created_at < START_OF_TIME:
+            return True
+        if payload.user_id == message.author.id:
+            return False
+        if message.author == self.bot.user:
+            return False
+
+        threshold = VOTES_THRESH[message.guild.id]
+        reaction = self.voting_reaction(message)
+        if reaction is None:
+            return self.payload_vote_weight(payload) < threshold
+        return (
+            self.reaction_vote_count(reaction) + self.payload_vote_weight(payload)
+        ) < threshold
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
         if getattr(payload.emoji, "id", 0) != VOTING_EMOJI_ID:
@@ -102,7 +133,21 @@ class Points(commands.Cog):
             return
 
         channel = self.bot.get_channel(payload.channel_id)
+        message = self.cached_message(payload.message_id)
+
+        if message is not None:
+            if self.cached_vote_is_below_threshold(payload, message):
+                return
+            if message.created_at < START_OF_TIME:
+                return
+            if message.author == self.bot.user:
+                await message.clear_reaction(VOTING_EMOJI)
+                return
+
         message = await channel.fetch_message(payload.message_id)
+        await self.process_voting_reaction(payload, channel, message)
+
+    async def process_voting_reaction(self, payload, channel, message):
         guild = message.guild
 
         if message.created_at < START_OF_TIME:
@@ -111,21 +156,24 @@ class Points(commands.Cog):
             await message.clear_reaction(VOTING_EMOJI)
             return
 
-        for reaction in message.reactions:
-            if getattr(reaction.emoji, "id", 0) == VOTING_EMOJI_ID:
-                break
-        else:
+        reaction = self.voting_reaction(message)
+        if reaction is None:
             logger.warning(
                 f"couldn't find voting reaction on {message.jump_url} "
                 f"even though {payload.user_id} reacted"
             )
             return  # maybe quickly un-reacted...?
 
+        count = self.reaction_vote_count(reaction)
+        current_user_is_author = payload.user_id == message.author.id
+        if not current_user_is_author and count < VOTES_THRESH[guild.id]:
+            return
+
         async with INDUCTION_LOCK:
             if payload.message_id in self._inducted_cache:
                 return  # another coro probably just inducted it
 
-            count = reaction.normal_count + 2 * reaction.burst_count
+            count = self.reaction_vote_count(reaction)
             voted_for_self = False
             async for user in reaction.users():
                 if user == self.bot.user:
@@ -136,6 +184,10 @@ class Points(commands.Cog):
                 if user == message.author:
                     voted_for_self = True
                     count -= 1
+
+            if current_user_is_author and not voted_for_self:
+                voted_for_self = True
+                count -= 1
 
             if voted_for_self or (count >= VOTES_THRESH[guild.id]):
                 (points,) = random.choices(PTS_VALUES, cum_weights=PTS_CUM_WTS)
