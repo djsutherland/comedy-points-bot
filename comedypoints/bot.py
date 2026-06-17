@@ -8,8 +8,11 @@ from discord.ext import commands
 class ComedyPointsBot(commands.Bot):
 
     def __init__(self, **kwargs):
-        intents = discord.Intents.default()
-        intents.reactions = True
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.guild_messages = True
+        intents.guild_reactions = True
+        intents.emojis_and_stickers = True
         intents.message_content = True
 
         super().__init__(
