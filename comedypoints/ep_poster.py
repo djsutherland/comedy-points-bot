@@ -25,8 +25,10 @@
 # SOFTWARE.
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 from dataclasses import dataclass, field
+import functools
 from html import unescape
 from html.parser import HTMLParser
 from logging import getLogger
@@ -97,13 +99,26 @@ class FeedMetadata:
     items: tuple[FeedItemMetadata, ...] = field(default_factory=tuple)
 
 
-async def run_in_thread(func, *args, default=None, **kwargs):
+async def run_blocking(func, *args, executor=None, **kwargs):
+    call = functools.partial(func, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, call)
+
+
+async def run_in_thread(func, *args, default=None, executor=None, **kwargs):
     """Runs a blocking reader task in a separate thread."""
     try:
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await run_blocking(func, *args, executor=executor, **kwargs)
     except ReaderError as error:
         logger.error("Error executing task: %s", error)
         return default
+
+
+def _make_initialized_reader(db_path: str):
+    reader = make_reader(db_path)
+    parser = getattr(reader, "_parser", None)
+    getattr(parser, "_lazy_init", lambda: None)()
+    return reader
 
 
 class EpPoster(commands.Cog):
@@ -112,23 +127,43 @@ class EpPoster(commands.Cog):
         self._feed_cache = {}
         self._feed_cache_locks = {}
         self._update_lock = asyncio.Lock()
+        self._reader_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rss-reader"
+        )
+        self.reader = None
 
-        logger.info("Initializing RSS reader")
-        self.reader = make_reader(READER_DB_PATH)
-        # self.reader.set_tag((), ".reader.update", {"interval": 6, "jitter": 0.8})
+    async def _run_reader(self, operation, *, default=None):
+        reader = self.reader
+        if reader is None:
+            raise RuntimeError("RSS reader is not initialized")
+        return await run_in_thread(
+            operation, reader, default=default, executor=self._reader_executor
+        )
 
-        # make sure the reader lazy-init is done
-        parser = getattr(self.reader, "_parser", None)
-        getattr(parser, "_lazy_init", lambda: None)()
+    async def _run_reader_method(self, method_name, *args, default=None, **kwargs):
+        def operation(reader):
+            return getattr(reader, method_name)(*args, **kwargs)
+
+        return await self._run_reader(operation, default=default)
 
     async def cog_load(self):
-        await asyncio.gather(
-            *[run_in_thread(self.reader.add_feed, url, exist_ok=True) for url in FEEDS]
+        logger.info("Initializing RSS reader")
+        self.reader = await run_blocking(
+            _make_initialized_reader, READER_DB_PATH, executor=self._reader_executor
         )
-        curr = {feed.url for feed in self.reader.get_feeds()}
+        # self.reader.set_tag((), ".reader.update", {"interval": 6, "jitter": 0.8})
+
+        await asyncio.gather(
+            *[
+                self._run_reader_method("add_feed", url, exist_ok=True)
+                for url in FEEDS
+            ]
+        )
+        feeds = await self._run_reader(lambda reader: list(reader.get_feeds()))
+        curr = {feed.url for feed in feeds}
         if to_del := curr - FEEDS:
             await asyncio.gather(
-                *[run_in_thread(self.reader.delete_feed, url) for url in to_del]
+                *[self._run_reader_method("delete_feed", url) for url in to_del]
             )
         self.check_feeds.start()
         self.clear_feed_caches.start()
@@ -136,6 +171,7 @@ class EpPoster(commands.Cog):
     async def cog_unload(self):
         self.check_feeds.cancel()
         self.clear_feed_caches.cancel()
+        self._reader_executor.shutdown(wait=False, cancel_futures=True)
 
     @tasks.loop(hours=24)
     async def clear_feed_caches(self):
@@ -150,11 +186,14 @@ class EpPoster(commands.Cog):
     async def check_feeds(self):
         async with self._update_lock:
             # don't use reader's timing mechanism, use ours
-            await run_in_thread(self.reader.update_feeds, scheduled=False)
+            await self._run_reader_method("update_feeds", scheduled=False)
 
             async with asyncio.TaskGroup() as tg:
                 posted = 0
-                for entry in self.reader.get_entries(read=False):
+                entries = await self._run_reader(
+                    lambda reader: list(reader.get_entries(read=False)), default=[]
+                )
+                for entry in entries:
                     if (
                         not entry.published or entry.published > START_OF_TIME
                     ) and posted <= 3:
@@ -162,7 +201,7 @@ class EpPoster(commands.Cog):
                         posted += 1
                     else:
                         tg.create_task(
-                            run_in_thread(self.reader.mark_entry_as_read, entry)
+                            self._run_reader_method("mark_entry_as_read", entry)
                         )
 
     async def _get_feed_metadata(self, feed_url: str) -> FeedMetadata:
@@ -175,7 +214,7 @@ class EpPoster(commands.Cog):
                 return cached
 
             try:
-                metadata = await asyncio.to_thread(_fetch_feed_metadata, feed_url)
+                metadata = await run_blocking(_fetch_feed_metadata, feed_url)
             except Exception:
                 logger.warning(
                     "Failed to fetch feed metadata for %s", feed_url, exc_info=True
@@ -197,7 +236,7 @@ class EpPoster(commands.Cog):
             view=view, allowed_mentions=discord.AllowedMentions.none()
         )
         await channel.send(role.mention, allowed_mentions=discord.AllowedMentions.all())
-        await run_in_thread(self.reader.mark_entry_as_read, entry)
+        await self._run_reader_method("mark_entry_as_read", entry)
 
     async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata]:
         feed_metadata = await self._get_feed_metadata(entry.feed_url)
