@@ -10,11 +10,30 @@ from dotenv import load_dotenv
 from comedypoints import ComedyPointsBot
 
 
+def _is_gateway_diagnostic_record(record: logging.LogRecord) -> bool:
+    message = record.getMessage()
+    if record.name == "discord.gateway":
+        return "Can't keep up" in message or "heartbeat blocked" in message
+
+    if record.name == "comedypoints.monitoring":
+        return message.startswith(
+            "High gateway latency detected:"
+        ) or message.startswith("Event loop lag detected:")
+
+    return False
+
+
 def _allow_dm_log_record(record: logging.LogRecord) -> bool:
-    return not (
+    if (
         record.name == "reader"
         and "NonXMLContentType('no Content-type specified')" in record.getMessage()
-    )
+    ):
+        return False
+
+    if _is_gateway_diagnostic_record(record):
+        return False
+
+    return True
 
 
 def main():

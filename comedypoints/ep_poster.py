@@ -154,10 +154,7 @@ class EpPoster(commands.Cog):
         # self.reader.set_tag((), ".reader.update", {"interval": 6, "jitter": 0.8})
 
         await asyncio.gather(
-            *[
-                self._run_reader_method("add_feed", url, exist_ok=True)
-                for url in FEEDS
-            ]
+            *[self._run_reader_method("add_feed", url, exist_ok=True) for url in FEEDS]
         )
         feeds = await self._run_reader(lambda reader: list(reader.get_feeds()))
         curr = {feed.url for feed in feeds}
