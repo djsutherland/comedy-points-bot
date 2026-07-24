@@ -92,9 +92,6 @@ class Points(commands.Cog):
         self._channel_is_private[channel] = result
         return result
 
-    def cached_message(self, message_id):
-        return discord.utils.get(self.bot.cached_messages, id=message_id)
-
     def voting_reaction(self, message):
         for reaction in message.reactions:
             if getattr(reaction.emoji, "id", 0) == VOTING_EMOJI_ID:
@@ -107,22 +104,6 @@ class Points(commands.Cog):
     def payload_vote_weight(self, payload):
         return 2 if getattr(payload, "burst", False) else 1
 
-    def cached_vote_is_below_threshold(self, payload, message):
-        if message.created_at < START_OF_TIME:
-            return True
-        if payload.user_id == message.author.id:
-            return False
-        if message.author == self.bot.user:
-            return False
-
-        threshold = VOTES_THRESH[message.guild.id]
-        reaction = self.voting_reaction(message)
-        if reaction is None:
-            return self.payload_vote_weight(payload) < threshold
-        return (
-            self.reaction_vote_count(reaction) + self.payload_vote_weight(payload)
-        ) < threshold
-
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
         if getattr(payload.emoji, "id", 0) != VOTING_EMOJI_ID:
@@ -133,11 +114,8 @@ class Points(commands.Cog):
             return
 
         channel = self.bot.get_channel(payload.channel_id)
-        message = self.cached_message(payload.message_id)
-
+        message = discord.utils.get(self.bot.cached_messages, id=payload.message_id)
         if message is not None:
-            if self.cached_vote_is_below_threshold(payload, message):
-                return
             if message.created_at < START_OF_TIME:
                 return
             if message.author == self.bot.user:
@@ -145,9 +123,6 @@ class Points(commands.Cog):
                 return
 
         message = await channel.fetch_message(payload.message_id)
-        await self.process_voting_reaction(payload, channel, message)
-
-    async def process_voting_reaction(self, payload, channel, message):
         guild = message.guild
 
         if message.created_at < START_OF_TIME:
@@ -165,8 +140,7 @@ class Points(commands.Cog):
             return  # maybe quickly un-reacted...?
 
         count = self.reaction_vote_count(reaction)
-        current_user_is_author = payload.user_id == message.author.id
-        if not current_user_is_author and count < VOTES_THRESH[guild.id]:
+        if payload.user_id != message.author.id and count < VOTES_THRESH[guild.id]:
             return
 
         async with INDUCTION_LOCK:
@@ -184,10 +158,6 @@ class Points(commands.Cog):
                 if user == message.author:
                     voted_for_self = True
                     count -= 1
-
-            if current_user_is_author and not voted_for_self:
-                voted_for_self = True
-                count -= 1
 
             if voted_for_self or (count >= VOTES_THRESH[guild.id]):
                 (points,) = random.choices(PTS_VALUES, cum_weights=PTS_CUM_WTS)
