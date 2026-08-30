@@ -81,6 +81,10 @@ def _format_log_datetime(value) -> str:
     return value.isoformat()
 
 
+def _entry_first_seen(entry):
+    return getattr(entry, "first_updated", None) or getattr(entry, "added", None)
+
+
 def _safe_log_text(value, limit: int = 240) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ")
     for feed_url in FEEDS:
@@ -490,7 +494,7 @@ class EpPoster(commands.Cog):
                         poll_id,
                         _safe_log_text(entry.title),
                         _format_log_datetime(entry.published),
-                        _format_log_datetime(getattr(entry, "first_updated", None)),
+                        _format_log_datetime(_entry_first_seen(entry)),
                         _format_log_datetime(getattr(entry, "last_updated", None)),
                     )
                     if (
@@ -539,7 +543,7 @@ class EpPoster(commands.Cog):
                             latest_entry.published if latest_entry is not None else None
                         ),
                         "latest_entry_first_seen": (
-                            latest_entry.first_updated
+                            _entry_first_seen(latest_entry)
                             if latest_entry is not None
                             else None
                         ),
