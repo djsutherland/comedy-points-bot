@@ -35,6 +35,7 @@ from logging import getLogger
 import os
 from pathlib import Path
 import re
+import time
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
@@ -67,15 +68,26 @@ CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
 FEED_FETCH_TIMEOUT = 15
 
 NY = ZoneInfo("America/New_York")
-UPDATE_TIMES = [
-    datetime.time(hour=0, minute=m, second=s, tzinfo=NY)
-    for m in [0, 1, 2, 3, 4]
-    for s in [2, 17, 36, 48]
-] + [
-    datetime.time(hour=h, minute=m, second=47, tzinfo=NY)
-    for h in range(24)
-    for m in range(6, 60, 4)
-]
+SURPRISE_DROP_POLL_MINUTES = 15
+EXPECTED_EPISODE_DAYS_OF_MONTH = {1, 11, 21}
+EXPECTED_EPISODE_START_TIME = datetime.time(hour=0, second=1, tzinfo=NY)
+EXPECTED_EPISODE_WINDOW = datetime.timedelta(minutes=10)
+EXPECTED_EPISODE_POLL_SECONDS = 12
+
+
+def _format_log_datetime(value) -> str:
+    if value is None:
+        return "none"
+    return value.isoformat()
+
+
+def _safe_log_text(value, limit: int = 240) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    for feed_url in FEEDS:
+        text = text.replace(feed_url, "<feed-url-redacted>")
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
 
 
 @dataclass(frozen=True)
@@ -110,7 +122,11 @@ async def run_in_thread(func, *args, default=None, executor=None, **kwargs):
     try:
         return await run_blocking(func, *args, executor=executor, **kwargs)
     except ReaderError as error:
-        logger.error("Error executing task: %s", error)
+        logger.error(
+            "Reader operation failed error_type=%s error=%s",
+            type(error).__name__,
+            _safe_log_text(error),
+        )
         return default
 
 
@@ -131,6 +147,16 @@ class EpPoster(commands.Cog):
             max_workers=1, thread_name_prefix="rss-reader"
         )
         self.reader = None
+        self._poll_sequence = 0
+        self._expecting_episode = False
+        self._episode_posted_event = asyncio.Event()
+        self._last_episode_posted_at = None
+        self._episode_posts_by_date = {}
+        self._startup_expectation_task = None
+        self._feed_labels = {
+            feed_url: f"feed-{index}"
+            for index, feed_url in enumerate(sorted(FEEDS), start=1)
+        }
 
     async def _run_reader(self, operation, *, default=None):
         reader = self.reader
@@ -162,78 +188,552 @@ class EpPoster(commands.Cog):
             await asyncio.gather(
                 *[self._run_reader_method("delete_feed", url) for url in to_del]
             )
+        logger.info(
+            "RSS reader initialized feeds=%d fallback_minutes=%d "
+            "expected_start_et=%s expected_window_minutes=%.0f "
+            "expected_poll_seconds=%d",
+            len(curr),
+            SURPRISE_DROP_POLL_MINUTES,
+            EXPECTED_EPISODE_START_TIME.isoformat(),
+            EXPECTED_EPISODE_WINDOW.total_seconds() / 60,
+            EXPECTED_EPISODE_POLL_SECONDS,
+        )
         self.check_feeds.start()
+        self.expect_episode.start()
         self.clear_feed_caches.start()
+        self._startup_expectation_task = asyncio.create_task(
+            self._run_startup_expectation(),
+            name="rss-startup-episode-expectation",
+        )
 
     async def cog_unload(self):
         self.check_feeds.cancel()
+        self.expect_episode.cancel()
         self.clear_feed_caches.cancel()
+        if self._startup_expectation_task is not None:
+            self._startup_expectation_task.cancel()
         self._reader_executor.shutdown(wait=False, cancel_futures=True)
 
     @tasks.loop(hours=24)
     async def clear_feed_caches(self):
+        logger.info(
+            "Clearing RSS metadata cache entries=%d at_utc=%s",
+            len(self._feed_cache),
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        )
         self._feed_cache.clear()
 
     @commands.command("rss", hidden=True)
     async def _do_rss(self, ctx):
-        await self.check_feeds()
+        await self._check_feeds(trigger="manual")
         await ctx.message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
 
-    @tasks.loop(time=UPDATE_TIMES)
+    @tasks.loop(minutes=SURPRISE_DROP_POLL_MINUTES)
     async def check_feeds(self):
+        if self._expecting_episode:
+            logger.info("RSS fallback poll skipped reason=episode-watcher-active")
+            return
+        try:
+            await self._check_feeds(trigger="fallback")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error(
+                "RSS fallback poll failed error_type=%s error=%s",
+                type(error).__name__,
+                _safe_log_text(error, limit=1000),
+            )
+
+    @check_feeds.before_loop
+    async def before_check_feeds(self):
+        await self.bot.wait_until_ready()
+
+    @check_feeds.error
+    async def check_feeds_error(self, error):
+        logger.error(
+            "RSS fallback polling loop stopped error_type=%s error=%s",
+            type(error).__name__,
+            _safe_log_text(error, limit=1000),
+        )
+
+    @tasks.loop(time=EXPECTED_EPISODE_START_TIME)
+    async def expect_episode(self):
+        await self._expect_episode(trigger="scheduled")
+
+    @expect_episode.before_loop
+    async def before_expect_episode(self):
+        await self.bot.wait_until_ready()
+
+    @expect_episode.error
+    async def expect_episode_error(self, error):
+        logger.error(
+            "RSS expected-episode loop stopped error_type=%s error=%s",
+            type(error).__name__,
+            _safe_log_text(error, limit=1000),
+        )
+
+    async def _run_startup_expectation(self):
+        await self.bot.wait_until_ready()
+        await self._expect_episode(trigger="startup")
+
+    def _expected_episode_reasons(self, date: datetime.date) -> tuple[str, ...]:
+        reasons = []
+        if date.weekday() == 6:
+            reasons.append("sunday-public")
+        if date.day in EXPECTED_EPISODE_DAYS_OF_MONTH:
+            reasons.append(f"patreon-day-{date.day}")
+        return tuple(reasons)
+
+    async def _expect_episode(self, *, trigger: str):
+        now_et = datetime.datetime.now(NY)
+        episode_date = now_et.date()
+        reasons = self._expected_episode_reasons(episode_date)
+        if not reasons:
+            logger.info(
+                "RSS episode watcher not needed trigger=%s date_et=%s",
+                trigger,
+                episode_date.isoformat(),
+            )
+            return
+        reason = ",".join(reasons)
+        expected_posts = len(reasons)
+
+        window_start = datetime.datetime.combine(
+            episode_date, EXPECTED_EPISODE_START_TIME
+        )
+        window_end = window_start + EXPECTED_EPISODE_WINDOW
+        if now_et >= window_end:
+            logger.info(
+                "RSS episode watcher outside window trigger=%s reason=%s "
+                "at_et=%s window_end_et=%s",
+                trigger,
+                reason,
+                now_et.isoformat(),
+                window_end.isoformat(),
+            )
+            return
+
+        if self._expecting_episode:
+            logger.info(
+                "RSS episode watcher already active trigger=%s reason=%s",
+                trigger,
+                reason,
+            )
+            return
+
+        self._expecting_episode = True
+        try:
+            if now_et < window_start:
+                wait_seconds = (window_start - now_et).total_seconds()
+                logger.info(
+                    "RSS episode watcher waiting for window trigger=%s reason=%s "
+                    "wait_seconds=%.1f",
+                    trigger,
+                    reason,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
+
+            already_posted = self._episode_posts_by_date.get(episode_date, 0)
+            if already_posted >= expected_posts:
+                logger.info(
+                    "RSS episode watcher found expected posts already sent "
+                    "trigger=%s reason=%s posted=%d expected=%d",
+                    trigger,
+                    reason,
+                    already_posted,
+                    expected_posts,
+                )
+                return
+
+            self._episode_posted_event.clear()
+            logger.info(
+                "RSS episode watcher starting trigger=%s reason=%s "
+                "window_end_et=%s poll_seconds=%d posted=%d expected=%d",
+                trigger,
+                reason,
+                window_end.isoformat(),
+                EXPECTED_EPISODE_POLL_SECONDS,
+                already_posted,
+                expected_posts,
+            )
+
+            attempt = 0
+            while datetime.datetime.now(NY) < window_end:
+                attempt += 1
+                try:
+                    await self._check_feeds(
+                        trigger=f"expected:{reason}:attempt-{attempt}"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error(
+                        "RSS episode watcher poll failed trigger=%s reason=%s "
+                        "attempt=%d error_type=%s error=%s",
+                        trigger,
+                        reason,
+                        attempt,
+                        type(error).__name__,
+                        _safe_log_text(error, limit=1000),
+                    )
+
+                posted_count = self._episode_posts_by_date.get(episode_date, 0)
+                if posted_count >= expected_posts:
+                    logger.info(
+                        "RSS episode watcher succeeded trigger=%s reason=%s "
+                        "attempt=%d posted=%d expected=%d posted_at=%s",
+                        trigger,
+                        reason,
+                        attempt,
+                        posted_count,
+                        expected_posts,
+                        _format_log_datetime(self._last_episode_posted_at),
+                    )
+                    return
+
+                remaining = (window_end - datetime.datetime.now(NY)).total_seconds()
+                if remaining <= 0:
+                    break
+                self._episode_posted_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._episode_posted_event.wait(),
+                        timeout=min(EXPECTED_EPISODE_POLL_SECONDS, remaining),
+                    )
+                except TimeoutError:
+                    pass
+                else:
+                    posted_count = self._episode_posts_by_date.get(episode_date, 0)
+                    logger.info(
+                        "RSS episode watcher observed post between polls "
+                        "trigger=%s reason=%s attempt=%d posted=%d expected=%d",
+                        trigger,
+                        reason,
+                        attempt,
+                        posted_count,
+                        expected_posts,
+                    )
+
+            logger.warning(
+                "RSS episode watcher timed out trigger=%s reason=%s attempts=%d "
+                "posted=%d expected=%d window_end_et=%s",
+                trigger,
+                reason,
+                attempt,
+                self._episode_posts_by_date.get(episode_date, 0),
+                expected_posts,
+                window_end.isoformat(),
+            )
+        finally:
+            self._expecting_episode = False
+
+    async def _check_feeds(self, *, trigger: str):
+        self._poll_sequence += 1
+        poll_id = self._poll_sequence
+        started = time.perf_counter()
+        lock_started = started
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_et = now_utc.astimezone(NY)
+        logger.info(
+            "RSS poll starting poll=%d trigger=%s at_utc=%s at_et=%s",
+            poll_id,
+            trigger,
+            now_utc.isoformat(),
+            now_et.isoformat(),
+        )
+
         async with self._update_lock:
-            # don't use reader's timing mechanism, use ours
-            await self._run_reader_method("update_feeds", scheduled=False)
+            lock_acquired = time.perf_counter()
+            logger.info(
+                "RSS poll lock acquired poll=%d wait_ms=%.1f",
+                poll_id,
+                (lock_acquired - lock_started) * 1000,
+            )
+
+            before_feeds = await self._feed_diagnostics()
+            self._log_feed_diagnostics(poll_id, "before", before_feeds)
+
+            update_started = time.perf_counter()
+            # Use the iterator so per-feed parse and HTTP failures are observable.
+            update_results = await self._run_reader(
+                lambda reader: list(reader.update_feeds_iter(scheduled=False)),
+                default=None,
+            )
+            update_finished = time.perf_counter()
+            logger.info(
+                "RSS update finished poll=%d elapsed_ms=%.1f result_count=%s",
+                poll_id,
+                (update_finished - update_started) * 1000,
+                "failed" if update_results is None else len(update_results),
+            )
+            if update_results is not None:
+                self._log_update_results(poll_id, update_results)
+
+            after_feeds = await self._feed_diagnostics()
+            self._log_feed_diagnostics(poll_id, "after", after_feeds)
 
             async with asyncio.TaskGroup() as tg:
                 posted = 0
                 entries = await self._run_reader(
                     lambda reader: list(reader.get_entries(read=False)), default=[]
                 )
+                logger.info(
+                    "RSS unread entries poll=%d count=%d",
+                    poll_id,
+                    len(entries),
+                )
                 for entry in entries:
+                    logger.info(
+                        "RSS unread entry poll=%d title=%r published=%s "
+                        "first_seen=%s last_updated=%s",
+                        poll_id,
+                        _safe_log_text(entry.title),
+                        _format_log_datetime(entry.published),
+                        _format_log_datetime(getattr(entry, "first_updated", None)),
+                        _format_log_datetime(getattr(entry, "last_updated", None)),
+                    )
                     if (
                         not entry.published or entry.published > START_OF_TIME
                     ) and posted <= 3:
-                        tg.create_task(self.post_entry(entry))
+                        tg.create_task(self.post_entry(entry, poll_id=poll_id))
                         posted += 1
                     else:
+                        logger.info(
+                            "RSS entry skipped poll=%d title=%r reason=%s",
+                            poll_id,
+                            _safe_log_text(entry.title),
+                            "post-limit" if posted > 3 else "before-start-of-time",
+                        )
                         tg.create_task(
                             self._run_reader_method("mark_entry_as_read", entry)
                         )
 
+            logger.info(
+                "RSS poll finished poll=%d posted=%d total_elapsed_ms=%.1f",
+                poll_id,
+                posted,
+                (time.perf_counter() - started) * 1000,
+            )
+
+    async def _feed_diagnostics(self):
+        def operation(reader):
+            diagnostics = []
+            for feed in reader.get_feeds():
+                latest_entry = next(
+                    reader.get_entries(feed=feed, limit=1),
+                    None,
+                )
+                diagnostics.append(
+                    {
+                        "url": feed.url,
+                        "title": feed.title,
+                        "last_retrieved": feed.last_retrieved,
+                        "last_updated": feed.last_updated,
+                        "update_after": feed.update_after,
+                        "last_exception": feed.last_exception,
+                        "latest_entry_title": (
+                            latest_entry.title if latest_entry is not None else None
+                        ),
+                        "latest_entry_published": (
+                            latest_entry.published if latest_entry is not None else None
+                        ),
+                        "latest_entry_first_seen": (
+                            latest_entry.first_updated
+                            if latest_entry is not None
+                            else None
+                        ),
+                    }
+                )
+            return diagnostics
+
+        return await self._run_reader(operation, default=[])
+
+    def _feed_label(self, feed_url: str) -> str:
+        return self._feed_labels.get(feed_url, "unknown-feed")
+
+    def _log_feed_diagnostics(self, poll_id: int, phase: str, feeds):
+        for feed in feeds:
+            last_exception = feed["last_exception"]
+            exception_text = "none"
+            if last_exception is not None:
+                exception_text = _safe_log_text(
+                    f"{last_exception.type_name}: {last_exception.value_str}"
+                )
+            logger.info(
+                "RSS feed state poll=%d phase=%s feed=%s title=%r "
+                "last_retrieved=%s last_updated=%s update_after=%s "
+                "last_exception=%s latest_entry=%r latest_published=%s "
+                "latest_first_seen=%s",
+                poll_id,
+                phase,
+                self._feed_label(feed["url"]),
+                _safe_log_text(feed["title"]),
+                _format_log_datetime(feed["last_retrieved"]),
+                _format_log_datetime(feed["last_updated"]),
+                _format_log_datetime(feed["update_after"]),
+                exception_text,
+                _safe_log_text(feed["latest_entry_title"]),
+                _format_log_datetime(feed["latest_entry_published"]),
+                _format_log_datetime(feed["latest_entry_first_seen"]),
+            )
+
+    def _log_update_results(self, poll_id: int, results):
+        for result in results:
+            feed_url, value = result
+            feed_label = self._feed_label(feed_url)
+            if isinstance(value, Exception):
+                logger.error(
+                    "RSS update result poll=%d feed=%s status=error "
+                    "error_type=%s error=%s",
+                    poll_id,
+                    feed_label,
+                    type(value).__name__,
+                    _safe_log_text(value),
+                )
+            elif value is None:
+                logger.info(
+                    "RSS update result poll=%d feed=%s status=server-unchanged",
+                    poll_id,
+                    feed_label,
+                )
+            else:
+                logger.info(
+                    "RSS update result poll=%d feed=%s status=fetched new=%d "
+                    "modified=%d unmodified=%d",
+                    poll_id,
+                    feed_label,
+                    value.new,
+                    value.modified,
+                    value.unmodified,
+                )
+
     async def _get_feed_metadata(self, feed_url: str) -> FeedMetadata:
         if cached := self._feed_cache.get(feed_url):
+            logger.info(
+                "RSS metadata cache hit feed=%s items=%d",
+                self._feed_label(feed_url),
+                len(cached.items),
+            )
             return cached
 
         lock = self._feed_cache_locks.setdefault(feed_url, asyncio.Lock())
         async with lock:
             if cached := self._feed_cache.get(feed_url):
+                logger.info(
+                    "RSS metadata cache hit after lock feed=%s items=%d",
+                    self._feed_label(feed_url),
+                    len(cached.items),
+                )
                 return cached
 
+            started = time.perf_counter()
+            logger.info(
+                "RSS metadata fetch starting feed=%s timeout_seconds=%d",
+                self._feed_label(feed_url),
+                FEED_FETCH_TIMEOUT,
+            )
             try:
                 metadata = await run_blocking(_fetch_feed_metadata, feed_url)
-            except Exception:
+            except Exception as error:
                 logger.warning(
-                    "Failed to fetch feed metadata for %s", feed_url, exc_info=True
+                    "RSS metadata fetch failed feed=%s elapsed_ms=%.1f "
+                    "error_type=%s error=%s",
+                    self._feed_label(feed_url),
+                    (time.perf_counter() - started) * 1000,
+                    type(error).__name__,
+                    _safe_log_text(error),
                 )
                 metadata = FeedMetadata()
+            else:
+                logger.info(
+                    "RSS metadata fetch finished feed=%s elapsed_ms=%.1f items=%d",
+                    self._feed_label(feed_url),
+                    (time.perf_counter() - started) * 1000,
+                    len(metadata.items),
+                )
 
             self._feed_cache[feed_url] = metadata
             return metadata
 
-    async def post_entry(self, entry):
-        channel = self.bot.get_channel(TARGET_CHANNEL) or (
-            await self.bot.fetch_channel(TARGET_CHANNEL)
-        )  # should only need to fetch at most once
-        guild = channel.guild
-        role = guild.get_role(TARGET_ROLE) or (await guild.fetch_role(TARGET_ROLE))
+    async def post_entry(self, entry, *, poll_id: int):
+        started = time.perf_counter()
+        stage = "resolve-channel"
+        title = _safe_log_text(entry.title)
+        logger.info("RSS post starting poll=%d title=%r", poll_id, title)
+        try:
+            channel = self.bot.get_channel(TARGET_CHANNEL) or (
+                await self.bot.fetch_channel(TARGET_CHANNEL)
+            )  # should only need to fetch at most once
+            stage = "resolve-role"
+            guild = channel.guild
+            role = guild.get_role(TARGET_ROLE) or (await guild.fetch_role(TARGET_ROLE))
 
-        view = await self._build_episode_card(entry)
-        msg = await channel.send(
-            view=view, allowed_mentions=discord.AllowedMentions.none()
-        )
-        await channel.send(role.mention, allowed_mentions=discord.AllowedMentions.all())
-        await self._run_reader_method("mark_entry_as_read", entry)
+            stage = "build-card"
+            stage_started = time.perf_counter()
+            view = await self._build_episode_card(entry)
+            logger.info(
+                "RSS post card built poll=%d title=%r elapsed_ms=%.1f",
+                poll_id,
+                title,
+                (time.perf_counter() - stage_started) * 1000,
+            )
+
+            stage = "send-card"
+            stage_started = time.perf_counter()
+            msg = await channel.send(
+                view=view, allowed_mentions=discord.AllowedMentions.none()
+            )
+            logger.info(
+                "RSS post card sent poll=%d title=%r message_id=%d "
+                "elapsed_ms=%.1f total_elapsed_ms=%.1f",
+                poll_id,
+                title,
+                msg.id,
+                (time.perf_counter() - stage_started) * 1000,
+                (time.perf_counter() - started) * 1000,
+            )
+
+            stage = "send-mention"
+            stage_started = time.perf_counter()
+            mention = await channel.send(
+                role.mention, allowed_mentions=discord.AllowedMentions.all()
+            )
+            logger.info(
+                "RSS post mention sent poll=%d title=%r message_id=%d elapsed_ms=%.1f",
+                poll_id,
+                title,
+                mention.id,
+                (time.perf_counter() - stage_started) * 1000,
+            )
+
+            stage = "mark-read"
+            stage_started = time.perf_counter()
+            await self._run_reader_method("mark_entry_as_read", entry)
+            self._last_episode_posted_at = datetime.datetime.now(datetime.timezone.utc)
+            posted_date_et = self._last_episode_posted_at.astimezone(NY).date()
+            self._episode_posts_by_date[posted_date_et] = (
+                self._episode_posts_by_date.get(posted_date_et, 0) + 1
+            )
+            self._episode_posted_event.set()
+            logger.info(
+                "RSS post finished poll=%d title=%r mark_read_ms=%.1f "
+                "total_elapsed_ms=%.1f posted_at=%s",
+                poll_id,
+                title,
+                (time.perf_counter() - stage_started) * 1000,
+                (time.perf_counter() - started) * 1000,
+                self._last_episode_posted_at.isoformat(),
+            )
+        except Exception:
+            logger.exception(
+                "RSS post failed poll=%d title=%r stage=%s total_elapsed_ms=%.1f",
+                poll_id,
+                title,
+                stage,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise
 
     async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata]:
         feed_metadata = await self._get_feed_metadata(entry.feed_url)
