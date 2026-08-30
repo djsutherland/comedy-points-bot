@@ -5,6 +5,13 @@ import discord
 from discord.ext import commands
 
 
+def command_prefix(bot, message):
+    if message.guild is None:
+        return ""
+
+    return commands.when_mentioned(bot, message)
+
+
 class ComedyPointsBot(commands.Bot):
 
     def __init__(self, **kwargs):
@@ -12,12 +19,14 @@ class ComedyPointsBot(commands.Bot):
         intents.guilds = True
         intents.guild_messages = True
         intents.guild_reactions = True
+        intents.dm_messages = True
+        intents.dm_reactions = True
         intents.emojis_and_stickers = True
         intents.message_content = True
 
         super().__init__(
             intents=intents,
-            command_prefix=commands.when_mentioned,
+            command_prefix=command_prefix,
             strip_after_prefix=True,
             **kwargs,
         )
