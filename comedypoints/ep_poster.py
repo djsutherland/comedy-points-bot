@@ -365,6 +365,7 @@ class EpPoster(commands.Cog):
             attempt = 0
             while datetime.datetime.now(NY) < window_end:
                 attempt += 1
+                poll_started = time.monotonic()
                 try:
                     await self._check_feeds(
                         trigger=f"expected:{reason}:attempt-{attempt}"
@@ -399,25 +400,40 @@ class EpPoster(commands.Cog):
                 remaining = (window_end - datetime.datetime.now(NY)).total_seconds()
                 if remaining <= 0:
                     break
+                poll_elapsed = time.monotonic() - poll_started
+                wait_seconds = min(
+                    max(0, EXPECTED_EPISODE_POLL_SECONDS - poll_elapsed),
+                    remaining,
+                )
+                logger.info(
+                    "RSS episode watcher scheduling next poll trigger=%s "
+                    "reason=%s attempt=%d poll_elapsed_seconds=%.1f "
+                    "wait_seconds=%.1f",
+                    trigger,
+                    reason,
+                    attempt,
+                    poll_elapsed,
+                    wait_seconds,
+                )
                 self._episode_posted_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._episode_posted_event.wait(),
-                        timeout=min(EXPECTED_EPISODE_POLL_SECONDS, remaining),
-                    )
-                except TimeoutError:
-                    pass
-                else:
-                    posted_count = self._episode_posts_by_date.get(episode_date, 0)
-                    logger.info(
-                        "RSS episode watcher observed post between polls "
-                        "trigger=%s reason=%s attempt=%d posted=%d expected=%d",
-                        trigger,
-                        reason,
-                        attempt,
-                        posted_count,
-                        expected_posts,
-                    )
+                if wait_seconds > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._episode_posted_event.wait(), timeout=wait_seconds
+                        )
+                    except TimeoutError:
+                        pass
+                    else:
+                        posted_count = self._episode_posts_by_date.get(episode_date, 0)
+                        logger.info(
+                            "RSS episode watcher observed post between polls "
+                            "trigger=%s reason=%s attempt=%d posted=%d expected=%d",
+                            trigger,
+                            reason,
+                            attempt,
+                            posted_count,
+                            expected_posts,
+                        )
 
             logger.warning(
                 "RSS episode watcher timed out trigger=%s reason=%s attempts=%d "
