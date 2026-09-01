@@ -73,6 +73,33 @@ EXPECTED_EPISODE_DAYS_OF_MONTH = {1, 11, 21}
 EXPECTED_EPISODE_START_TIME = datetime.time(hour=0, second=1, tzinfo=NY)
 EXPECTED_EPISODE_WINDOW = datetime.timedelta(minutes=10)
 EXPECTED_EPISODE_POLL_SECONDS = 12
+RSS_REQUEST_HEADERS_TO_LOG = (
+    "cache-control",
+    "if-modified-since",
+    "if-none-match",
+)
+RSS_RESPONSE_HEADERS_TO_LOG = (
+    "age",
+    "cache-control",
+    "cdn-cache-control",
+    "cf-cache-status",
+    "cf-ray",
+    "content-length",
+    "date",
+    "etag",
+    "expires",
+    "last-modified",
+    "server",
+    "surrogate-control",
+    "vary",
+    "via",
+    "x-cache",
+    "x-cache-hits",
+    "x-envoy-upstream-service-time",
+    "x-patreon-uuid",
+    "x-served-by",
+    "x-timer",
+)
 
 
 def _format_log_datetime(value) -> str:
@@ -92,6 +119,42 @@ def _safe_log_text(value, limit: int = 240) -> str:
     if len(text) > limit:
         return text[: limit - 3] + "..."
     return text
+
+
+def _feed_label_for_url(feed_url: str) -> str:
+    try:
+        index = sorted(FEEDS).index(feed_url) + 1
+    except ValueError:
+        return "unknown-feed"
+    return f"feed-{index}"
+
+
+def _selected_headers(headers, names: tuple[str, ...]) -> dict[str, str]:
+    normalized = {str(name).lower(): value for name, value in headers.items()}
+    return {
+        name: _safe_log_text(value, limit=160)
+        for name in names
+        if (value := normalized.get(name)) is not None
+    }
+
+
+def _log_feed_http_response(session, response, request, **kwargs):
+    del session, kwargs
+    request_headers = _selected_headers(
+        request.headers or {}, RSS_REQUEST_HEADERS_TO_LOG
+    )
+    response_headers = _selected_headers(
+        response.headers, RSS_RESPONSE_HEADERS_TO_LOG
+    )
+    logger.info(
+        "RSS HTTP response feed=%s status=%d elapsed_ms=%.1f "
+        "request_cache_headers=%r response_cache_headers=%r",
+        _feed_label_for_url(str(request.url)),
+        response.status_code,
+        response.elapsed.total_seconds() * 1000,
+        request_headers,
+        response_headers,
+    )
 
 
 @dataclass(frozen=True)
@@ -138,6 +201,14 @@ def _make_initialized_reader(db_path: str):
     reader = make_reader(db_path)
     parser = getattr(reader, "_parser", None)
     getattr(parser, "_lazy_init", lambda: None)()
+    session_factory = getattr(parser, "session_factory", None)
+    if session_factory is None:
+        logger.warning("RSS HTTP header logging unavailable reason=no-session-factory")
+    else:
+        session_factory.response_hooks = [
+            *session_factory.response_hooks,
+            _log_feed_http_response,
+        ]
     return reader
 
 
