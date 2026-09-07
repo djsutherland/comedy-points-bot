@@ -36,6 +36,16 @@ Generate the stable subscription secret with, for example,
 subscription at startup, verifies HMAC signatures on deliveries, records the
 lease granted by the hub, and renews at 80% of the lease duration.
 
+Subscription requests explicitly use `hub.verify=async` and a 60-second HTTP
+timeout (metadata fetches still use 15 seconds). Response headers are logged
+before the response body is read; failures identify which stage timed out.
+After an uncertain request failure, the bot continues accepting verification
+for up to 60 seconds. A verification already received is not discarded just
+because the subscription POST subsequently times out. Failed attempts retry
+after 15, 30, 60, 120, 240, then 300 seconds, resetting after success. These
+delays are in addition to the request/verification waits. Request payloads,
+response bodies, callback URLs, and secrets are not logged.
+
 Cross-source claims are stored in `episode-claims.sqlite` by default. Override
 that path with `EPISODE_CLAIMS_DB` if deployment state lives elsewhere. Keep the
 database across restarts. Completed claims expire after 30 days so genuinely

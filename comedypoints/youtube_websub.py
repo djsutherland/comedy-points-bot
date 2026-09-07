@@ -37,6 +37,8 @@ YOUTUBE_NOTIFICATION_MAX_AGE = datetime.timedelta(hours=6)
 YOUTUBE_NOTIFICATION_FUTURE_TOLERANCE = datetime.timedelta(minutes=5)
 YOUTUBE_METADATA_ATTEMPTS = 3
 YOUTUBE_HTTP_TIMEOUT = ClientTimeout(total=15)
+YOUTUBE_SUBSCRIPTION_TIMEOUT = ClientTimeout(total=60)
+YOUTUBE_VERIFICATION_WAIT_SECONDS = 60
 
 ATOM_NS = "http://www.w3.org/2005/Atom"
 MEDIA_NS = "http://search.yahoo.com/mrss/"
@@ -134,6 +136,10 @@ def _renewal_delay(lease_seconds):
     return lease_seconds * 0.8
 
 
+def _subscription_retry_delay(failures):
+    return min(300, 15 * 2 ** min(max(failures - 1, 0), 5))
+
+
 class YouTubeWebSub(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -146,6 +152,7 @@ class YouTubeWebSub(commands.Cog):
         self._activated_at = None
         self._pending_subscription = False
         self._verified_event = asyncio.Event()
+        self._verified_at_monotonic = None
         self._lease_seconds = None
 
     async def cog_load(self):
@@ -261,6 +268,7 @@ class YouTubeWebSub(commands.Cog):
             )
             return web.Response(status=404)
         self._pending_subscription = False
+        self._verified_at_monotonic = time.monotonic()
         self._verified_event.set()
         return web.Response(
             body=challenge.encode(),
@@ -511,71 +519,124 @@ class YouTubeWebSub(commands.Cog):
 
     async def _subscription_loop(self):
         await self.bot.wait_until_ready()
+        failures = 0
         while True:
-            self._verified_event.clear()
-            self._pending_subscription = True
-            started = time.perf_counter()
+            renew_seconds = await self._subscribe_once(attempt=failures + 1)
+            if renew_seconds is not None:
+                failures = 0
+                await asyncio.sleep(renew_seconds)
+            else:
+                failures += 1
+                retry_seconds = _subscription_retry_delay(failures)
+                logger.warning(
+                    "YouTube WebSub subscription retry scheduled failures=%d retry_seconds=%d",
+                    failures, retry_seconds,
+                )
+                await asyncio.sleep(retry_seconds)
+
+    async def _subscribe_once(self, *, attempt):
+        self._verified_event.clear()
+        self._verified_at_monotonic = None
+        self._lease_seconds = None
+        self._pending_subscription = True
+        started = time.perf_counter()
+        status = None
+        stage = "await-response-headers"
+        logger.info(
+            "YouTube WebSub subscription request starting attempt=%d "
+            "verify=async timeout_seconds=60",
+            attempt,
+        )
+        try:
             try:
                 async with self._session.post(
                     YOUTUBE_HUB_URL,
                     data={
                         "hub.callback": YOUTUBE_CALLBACK_URL,
                         "hub.mode": "subscribe",
+                        "hub.verify": "async",
                         "hub.topic": YOUTUBE_TOPIC_URL,
                         "hub.secret": YOUTUBE_SECRET,
                     },
                     allow_redirects=False,
+                    timeout=YOUTUBE_SUBSCRIPTION_TIMEOUT,
                 ) as response:
                     status = response.status
-                    await response.read()
+                    logger.info(
+                        "YouTube WebSub subscription response headers attempt=%d "
+                        "status=%d elapsed_ms=%.1f verification_received=%s",
+                        attempt, status, (time.perf_counter() - started) * 1000,
+                        self._verified_event.is_set(),
+                    )
+                    stage = "read-response-body"
+                    body = await response.read()
+                    logger.info(
+                        "YouTube WebSub subscription response complete attempt=%d "
+                        "status=%d body_bytes=%d elapsed_ms=%.1f",
+                        attempt, status, len(body),
+                        (time.perf_counter() - started) * 1000,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                self._pending_subscription = False
+                # A timed-out request may still have been accepted by the hub.
+                # Keep verification open for a bounded grace period, and don't
+                # discard a challenge that arrived while the POST was in flight.
                 logger.warning(
-                    "YouTube WebSub subscription request failed error_type=%s "
-                    "elapsed_ms=%.1f retry_seconds=900",
-                    type(error).__name__,
+                    "YouTube WebSub subscription request failed attempt=%d "
+                    "stage=%s status=%s error_type=%s elapsed_ms=%.1f "
+                    "verification_received=%s",
+                    attempt, stage, status, type(error).__name__,
                     (time.perf_counter() - started) * 1000,
+                    self._verified_event.is_set(),
                 )
-                await asyncio.sleep(900)
-                continue
-
-            logger.info(
-                "YouTube WebSub subscription requested status=%d elapsed_ms=%.1f",
-                status,
-                (time.perf_counter() - started) * 1000,
-            )
-            if status < 200 or status >= 300:
-                self._pending_subscription = False
+            if (
+                status is not None
+                and not 200 <= status < 300
+                and not self._verified_event.is_set()
+            ):
                 logger.warning(
-                    "YouTube WebSub subscription request rejected status=%d "
-                    "retry_seconds=900",
-                    status,
+                    "YouTube WebSub subscription request rejected attempt=%d status=%d",
+                    attempt, status,
                 )
-                await asyncio.sleep(900)
-                continue
+                return None
 
-            try:
-                await asyncio.wait_for(self._verified_event.wait(), timeout=60)
-            except TimeoutError:
-                self._pending_subscription = False
-                logger.warning(
-                    "YouTube WebSub subscription verification timed out "
-                    "retry_seconds=900"
+            if not self._verified_event.is_set():
+                logger.info(
+                    "YouTube WebSub subscription awaiting verification attempt=%d "
+                    "wait_seconds=%d request_status=%s",
+                    attempt, YOUTUBE_VERIFICATION_WAIT_SECONDS, status,
                 )
-                await asyncio.sleep(900)
-                continue
+                try:
+                    await asyncio.wait_for(
+                        self._verified_event.wait(),
+                        timeout=YOUTUBE_VERIFICATION_WAIT_SECONDS,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "YouTube WebSub subscription verification timed out attempt=%d",
+                        attempt,
+                    )
+                    return None
 
             lease_seconds = self._lease_seconds or 5 * 24 * 60 * 60
-            renew_seconds = _renewal_delay(lease_seconds)
+            # The lease starts at verification, not when a slow POST finishes.
+            verified_at = self._verified_at_monotonic
+            elapsed_since_verification = (
+                time.monotonic() - verified_at if verified_at is not None else 0
+            )
+            renew_seconds = max(
+                0, _renewal_delay(lease_seconds) - elapsed_since_verification
+            )
             logger.info(
                 "YouTube WebSub subscription active lease_seconds=%d "
                 "renew_seconds=%.3f",
                 lease_seconds,
                 renew_seconds,
             )
-            await asyncio.sleep(renew_seconds)
+            return renew_seconds
+        finally:
+            self._pending_subscription = False
 
 
 def _video_from_api(item) -> YouTubeVideo:
