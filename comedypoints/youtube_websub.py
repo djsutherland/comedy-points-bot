@@ -1,9 +1,11 @@
 import asyncio
 from dataclasses import dataclass, replace
 import datetime
+import email.utils
 import hashlib
 import hmac
 from logging import getLogger
+import math
 import os
 import re
 import time
@@ -39,6 +41,7 @@ YOUTUBE_METADATA_ATTEMPTS = 3
 YOUTUBE_HTTP_TIMEOUT = ClientTimeout(total=15)
 YOUTUBE_SUBSCRIPTION_TIMEOUT = ClientTimeout(total=60)
 YOUTUBE_VERIFICATION_WAIT_SECONDS = 60
+YOUTUBE_RETRY_AFTER_MAX_SECONDS = 15 * 60
 
 ATOM_NS = "http://www.w3.org/2005/Atom"
 MEDIA_NS = "http://search.yahoo.com/mrss/"
@@ -136,8 +139,57 @@ def _renewal_delay(lease_seconds):
     return lease_seconds * 0.8
 
 
-def _subscription_retry_delay(failures):
-    return min(300, 15 * 2 ** min(max(failures - 1, 0), 5))
+def _subscription_retry_delay(failures, hub_retry_after=None):
+    backoff = min(300, 15 * 2 ** min(max(failures - 1, 0), 5))
+    if hub_retry_after is None:
+        return backoff
+    return max(backoff, min(hub_retry_after, YOUTUBE_RETRY_AFTER_MAX_SECONDS))
+
+
+def _parse_retry_after(value):
+    """Parse an HTTP Retry-After header into whole seconds, or None if unusable."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if retry_at is None:
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    return max(0, math.ceil((retry_at - datetime.datetime.now(UTC)).total_seconds()))
+
+
+@web.middleware
+async def _log_callback_requests(request, handler):
+    # Log every request reaching the listener, including paths the router
+    # rejects, so "did the hub ever call us?" is answerable from the journal.
+    started = time.perf_counter()
+    status = "unhandled-error"
+    try:
+        response = await handler(request)
+        status = response.status
+        return response
+    except web.HTTPException as error:
+        status = error.status
+        raise
+    finally:
+        logger.info(
+            "YouTube WebSub callback request method=%s path=%s query=%r "
+            "remote=%s forwarded_for=%s user_agent=%r status=%s elapsed_ms=%.1f",
+            request.method,
+            _safe_text(request.path),
+            _safe_text(request.query_string, 600),
+            request.remote,
+            _safe_text(request.headers.get("X-Forwarded-For", "none")),
+            _safe_text(request.headers.get("User-Agent", "none")),
+            status,
+            (time.perf_counter() - started) * 1000,
+        )
 
 
 class YouTubeWebSub(commands.Cog):
@@ -154,6 +206,7 @@ class YouTubeWebSub(commands.Cog):
         self._verified_event = asyncio.Event()
         self._verified_at_monotonic = None
         self._lease_seconds = None
+        self._hub_retry_after = None
 
     async def cog_load(self):
         missing = [
@@ -189,7 +242,9 @@ class YouTubeWebSub(commands.Cog):
         logger.info("YouTube WebSub activation cutoff=%s", self._activated_at.isoformat())
 
         self._session = ClientSession(timeout=YOUTUBE_HTTP_TIMEOUT)
-        app = web.Application(client_max_size=1024 * 1024)
+        app = web.Application(
+            client_max_size=1024 * 1024, middlewares=[_log_callback_requests]
+        )
         app.router.add_get(callback_path, self._handle_verification)
         app.router.add_post(callback_path, self._handle_notification)
         self._runner = web.AppRunner(app, access_log=None)
@@ -246,10 +301,12 @@ class YouTubeWebSub(commands.Cog):
             and self._pending_subscription
         )
         logger.info(
-            "YouTube WebSub verification mode=%s topic_matches=%s "
-            "pending=%s accepted=%s lease_seconds=%s",
+            "YouTube WebSub verification mode=%s topic_matches=%s topic=%r "
+            "challenge_present=%s pending=%s accepted=%s lease_seconds=%s",
             _safe_text(mode),
             topic == YOUTUBE_TOPIC_URL,
+            _safe_text(topic),
+            challenge is not None,
             self._pending_subscription,
             accepted,
             _safe_text(lease_text) if lease_text else "none",
@@ -527,10 +584,13 @@ class YouTubeWebSub(commands.Cog):
                 await asyncio.sleep(renew_seconds)
             else:
                 failures += 1
-                retry_seconds = _subscription_retry_delay(failures)
+                retry_seconds = _subscription_retry_delay(
+                    failures, self._hub_retry_after
+                )
                 logger.warning(
-                    "YouTube WebSub subscription retry scheduled failures=%d retry_seconds=%d",
-                    failures, retry_seconds,
+                    "YouTube WebSub subscription retry scheduled failures=%d "
+                    "retry_seconds=%d hub_retry_after=%s",
+                    failures, retry_seconds, self._hub_retry_after,
                 )
                 await asyncio.sleep(retry_seconds)
 
@@ -538,14 +598,21 @@ class YouTubeWebSub(commands.Cog):
         self._verified_event.clear()
         self._verified_at_monotonic = None
         self._lease_seconds = None
+        self._hub_retry_after = None
         self._pending_subscription = True
         started = time.perf_counter()
         status = None
+        body_text = "none"
         stage = "await-response-headers"
         logger.info(
-            "YouTube WebSub subscription request starting attempt=%d "
-            "verify=async timeout_seconds=60",
+            "YouTube WebSub subscription request starting attempt=%d hub=%s "
+            "callback=%s topic=%s verify=async secret_bytes=%d timeout_seconds=%s",
             attempt,
+            YOUTUBE_HUB_URL,
+            YOUTUBE_CALLBACK_URL,
+            YOUTUBE_TOPIC_URL,
+            len(YOUTUBE_SECRET.encode()) if YOUTUBE_SECRET else 0,
+            YOUTUBE_SUBSCRIPTION_TIMEOUT.total,
         )
         try:
             try:
@@ -562,19 +629,25 @@ class YouTubeWebSub(commands.Cog):
                     timeout=YOUTUBE_SUBSCRIPTION_TIMEOUT,
                 ) as response:
                     status = response.status
+                    self._hub_retry_after = _parse_retry_after(
+                        response.headers.get("Retry-After")
+                    )
                     logger.info(
                         "YouTube WebSub subscription response headers attempt=%d "
-                        "status=%d elapsed_ms=%.1f verification_received=%s",
+                        "status=%d elapsed_ms=%.1f verification_received=%s "
+                        "retry_after=%s headers=%s",
                         attempt, status, (time.perf_counter() - started) * 1000,
-                        self._verified_event.is_set(),
+                        self._verified_event.is_set(), self._hub_retry_after,
+                        _safe_text(dict(response.headers), 1500),
                     )
                     stage = "read-response-body"
                     body = await response.read()
+                    body_text = _safe_text(body.decode("utf-8", "replace"), 1000)
                     logger.info(
                         "YouTube WebSub subscription response complete attempt=%d "
-                        "status=%d body_bytes=%d elapsed_ms=%.1f",
+                        "status=%d body_bytes=%d elapsed_ms=%.1f body=%r",
                         attempt, status, len(body),
-                        (time.perf_counter() - started) * 1000,
+                        (time.perf_counter() - started) * 1000, body_text,
                     )
             except asyncio.CancelledError:
                 raise
@@ -596,8 +669,9 @@ class YouTubeWebSub(commands.Cog):
                 and not self._verified_event.is_set()
             ):
                 logger.warning(
-                    "YouTube WebSub subscription request rejected attempt=%d status=%d",
-                    attempt, status,
+                    "YouTube WebSub subscription request rejected attempt=%d "
+                    "status=%d retry_after=%s body=%r",
+                    attempt, status, self._hub_retry_after, body_text,
                 )
                 return None
 

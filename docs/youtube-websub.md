@@ -42,9 +42,23 @@ before the response body is read; failures identify which stage timed out.
 After an uncertain request failure, the bot continues accepting verification
 for up to 60 seconds. A verification already received is not discarded just
 because the subscription POST subsequently times out. Failed attempts retry
-after 15, 30, 60, 120, 240, then 300 seconds, resetting after success. These
-delays are in addition to the request/verification waits. Request payloads,
-response bodies, callback URLs, and secrets are not logged.
+after 15, 30, 60, 120, 240, then 300 seconds, resetting after success. A
+`Retry-After` header from the hub extends that delay, up to 15 minutes. These
+delays are in addition to the request/verification waits.
+
+For debugging, the subscription log lines include the callback and topic URLs,
+the hub's response headers, and its response body (truncated). Every request
+that reaches the callback listener is logged with its path, query string,
+forwarding headers, and response status, including requests the router
+rejects. The subscription secret itself is never logged; only its length is.
+
+A hub response of `503 Transient error; please try again later` with
+`Retry-After: 120` after roughly 20 seconds is a hub-side failure: the hub
+returns it before contacting the callback at all, for any callback, topic, or
+mode (observed 2026-09-07). Nothing on our side fixes it; the retry loop picks
+up the subscription once the hub recovers. A `400` names the invalid parameter
+instead, and a missing verification (`awaiting verification` followed by
+`verification timed out`) points at the reverse proxy or callback path.
 
 Cross-source claims are stored in `episode-claims.sqlite` by default. Override
 that path with `EPISODE_CLAIMS_DB` if deployment state lives elsewhere. Keep the
