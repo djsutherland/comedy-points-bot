@@ -8,6 +8,7 @@ from discord_lumberjack.handlers import DiscordDMHandler
 from dotenv import load_dotenv
 
 from comedypoints import ComedyPointsBot
+from comedypoints.log_redaction import install_log_redaction
 
 
 def _is_gateway_diagnostic_record(record: logging.LogRecord) -> bool:
@@ -52,6 +53,7 @@ def main():
         handler.addFilter(_allow_dm_log_record)
         logger.addHandler(handler)
 
+    install_log_redaction()
     bot = ComedyPointsBot()
     bot.run(os.environ["DISCORD_TOKEN"], log_handler=None)
 

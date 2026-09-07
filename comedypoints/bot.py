@@ -37,6 +37,7 @@ class ComedyPointsBot(commands.Bot):
             "comedypoints.points",
             "comedypoints.privateperms",
             "comedypoints.ep_poster",
+            "comedypoints.youtube_websub",
             "comedypoints.text_reacts",
         ]
 

@@ -1,4 +1,5 @@
 /rss-db.sqlite*
+/episode-claims.sqlite*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

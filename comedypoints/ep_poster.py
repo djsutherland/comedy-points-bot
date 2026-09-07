@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 import re
 import time
+import unicodedata
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
@@ -43,6 +44,8 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands, tasks
 from reader import make_reader, ReaderError
+
+from .episode_dedupe import EpisodeClaimStore
 
 logger = getLogger(__name__)
 
@@ -52,6 +55,10 @@ FEEDS = {
 }
 READER_DB_PATH = os.environ.get(
     "READER_DB", str(Path(__file__).parent.parent / "rss-db.sqlite")
+)
+EPISODE_CLAIMS_DB_PATH = os.environ.get(
+    "EPISODE_CLAIMS_DB",
+    str(Path(__file__).parent.parent / "episode-claims.sqlite"),
 )
 
 if os.environ.get("DEV_MODE"):
@@ -178,6 +185,21 @@ class FeedMetadata:
     items: tuple[FeedItemMetadata, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class EpisodeCandidate:
+    source: str
+    source_id: str
+    title: str
+    feed_title: str | None
+    summary: str | None
+    link: str | None
+    image_url: str | None
+    duration_seconds: int | None
+    published: datetime.datetime | None
+    observed_at: datetime.datetime | None
+    episode_type: str | None = None
+
+
 async def run_blocking(func, *args, executor=None, **kwargs):
     call = functools.partial(func, *args, **kwargs)
     loop = asyncio.get_running_loop()
@@ -218,6 +240,7 @@ class EpPoster(commands.Cog):
         self._feed_cache = {}
         self._feed_cache_locks = {}
         self._update_lock = asyncio.Lock()
+        self._post_lock = asyncio.Lock()
         self._reader_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rss-reader"
         )
@@ -228,6 +251,7 @@ class EpPoster(commands.Cog):
         self._last_episode_posted_at = None
         self._episode_posts_by_date = {}
         self._startup_expectation_task = None
+        self._claim_store = EpisodeClaimStore(EPISODE_CLAIMS_DB_PATH)
         self._feed_labels = {
             feed_url: f"feed-{index}"
             for index, feed_url in enumerate(sorted(FEEDS), start=1)
@@ -248,6 +272,18 @@ class EpPoster(commands.Cog):
         return await self._run_reader(operation, default=default)
 
     async def cog_load(self):
+        await run_blocking(self._claim_store.initialize)
+        recent_post_times = await run_blocking(self._claim_store.recent_post_times)
+        for posted_at in recent_post_times:
+            posted_date_et = posted_at.astimezone(NY).date()
+            self._episode_posts_by_date[posted_date_et] = (
+                self._episode_posts_by_date.get(posted_date_et, 0) + 1
+            )
+        logger.info(
+            "Episode dedupe initialized recent_posts=%d dates=%d",
+            len(recent_post_times),
+            len(self._episode_posts_by_date),
+        )
         logger.info("Initializing RSS reader")
         self.reader = await run_blocking(
             _make_initialized_reader, READER_DB_PATH, executor=self._reader_executor
@@ -749,82 +785,280 @@ class EpPoster(commands.Cog):
 
     async def post_entry(self, entry, *, poll_id: int):
         started = time.perf_counter()
-        stage = "resolve-channel"
         title = _safe_log_text(entry.title)
-        logger.info("RSS post starting poll=%d title=%r", poll_id, title)
-        try:
-            channel = self.bot.get_channel(TARGET_CHANNEL) or (
-                await self.bot.fetch_channel(TARGET_CHANNEL)
-            )  # should only need to fetch at most once
-            stage = "resolve-role"
-            guild = channel.guild
-            role = guild.get_role(TARGET_ROLE) or (await guild.fetch_role(TARGET_ROLE))
+        logger.info(
+            "RSS episode candidate starting poll=%d source_id=%s title=%r",
+            poll_id,
+            _safe_log_text(entry.id),
+            title,
+        )
+        feed_metadata, item_metadata = await self._get_item_metadata(entry)
+        candidate = EpisodeCandidate(
+            source="rss",
+            source_id=str(entry.id),
+            title=entry.title or "New episode",
+            feed_title=entry.feed_resolved_title or feed_metadata.title,
+            summary=_preferred_summary_source(entry, item_metadata),
+            link=entry.link or item_metadata.link,
+            image_url=item_metadata.image_url or feed_metadata.image_url,
+            duration_seconds=item_metadata.duration_seconds,
+            published=entry.published,
+            observed_at=_entry_first_seen(entry),
+            episode_type=item_metadata.episode_type,
+        )
+        posted = await self._post_candidate(candidate, trigger=f"rss:poll-{poll_id}")
+        mark_started = time.perf_counter()
+        await self._run_reader_method("mark_entry_as_read", entry)
+        logger.info(
+            "RSS episode candidate finished poll=%d source_id=%s title=%r "
+            "posted=%s mark_read_ms=%.1f total_elapsed_ms=%.1f",
+            poll_id,
+            _safe_log_text(entry.id),
+            title,
+            posted,
+            (time.perf_counter() - mark_started) * 1000,
+            (time.perf_counter() - started) * 1000,
+        )
+        return posted
 
-            stage = "build-card"
-            stage_started = time.perf_counter()
-            view = await self._build_episode_card(entry)
-            logger.info(
-                "RSS post card built poll=%d title=%r elapsed_ms=%.1f",
-                poll_id,
-                title,
-                (time.perf_counter() - stage_started) * 1000,
-            )
+    async def post_youtube_video(self, video, *, webhook_received_at):
+        candidate = EpisodeCandidate(
+            source="youtube",
+            source_id=video.video_id,
+            title=video.title,
+            feed_title=video.author or "Blank Check with Griffin & David",
+            summary=video.description,
+            link=video.link,
+            image_url=video.thumbnail_url,
+            duration_seconds=video.duration_seconds,
+            published=video.published,
+            observed_at=webhook_received_at,
+        )
+        return await self._post_candidate(candidate, trigger="youtube:websub")
 
-            stage = "send-card"
-            stage_started = time.perf_counter()
-            msg = await channel.send(
-                view=view, allowed_mentions=discord.AllowedMentions.none()
+    async def _post_candidate(self, candidate: EpisodeCandidate, *, trigger: str):
+        started = time.perf_counter()
+        normalized_title = _normalize_episode_title(candidate.title)
+        if not normalized_title:
+            logger.warning(
+                "Episode candidate ignored source=%s source_id=%s "
+                "trigger=%s reason=empty-normalized-title title=%r",
+                candidate.source,
+                _safe_log_text(candidate.source_id),
+                trigger,
+                _safe_log_text(candidate.title),
             )
-            logger.info(
-                "RSS post card sent poll=%d title=%r message_id=%d "
-                "elapsed_ms=%.1f total_elapsed_ms=%.1f",
-                poll_id,
-                title,
-                msg.id,
-                (time.perf_counter() - stage_started) * 1000,
-                (time.perf_counter() - started) * 1000,
-            )
+            return False
 
-            stage = "send-mention"
-            stage_started = time.perf_counter()
-            mention = await channel.send(
-                role.mention, allowed_mentions=discord.AllowedMentions.all()
-            )
-            logger.info(
-                "RSS post mention sent poll=%d title=%r message_id=%d elapsed_ms=%.1f",
-                poll_id,
-                title,
-                mention.id,
-                (time.perf_counter() - stage_started) * 1000,
-            )
+        published_to_observed = _datetime_delta_seconds(
+            candidate.observed_at, candidate.published
+        )
+        logger.info(
+            "Episode candidate received source=%s source_id=%s trigger=%s "
+            "title=%r normalized_title=%r published=%s observed_at=%s "
+            "published_to_observed_seconds=%s",
+            candidate.source,
+            _safe_log_text(candidate.source_id),
+            trigger,
+            _safe_log_text(candidate.title),
+            _safe_log_text(normalized_title),
+            _format_log_datetime(candidate.published),
+            _format_log_datetime(candidate.observed_at),
+            (
+                f"{published_to_observed:.3f}"
+                if published_to_observed is not None
+                else "none"
+            ),
+        )
 
-            stage = "mark-read"
-            stage_started = time.perf_counter()
-            await self._run_reader_method("mark_entry_as_read", entry)
-            self._last_episode_posted_at = datetime.datetime.now(datetime.timezone.utc)
-            posted_date_et = self._last_episode_posted_at.astimezone(NY).date()
-            self._episode_posts_by_date[posted_date_et] = (
-                self._episode_posts_by_date.get(posted_date_et, 0) + 1
+        async with self._post_lock:
+            claim = await run_blocking(
+                self._claim_store.claim,
+                normalized_title=normalized_title,
+                display_title=candidate.title,
+                source=candidate.source,
+                source_id=candidate.source_id,
+                published_at=candidate.published,
             )
-            self._episode_posted_event.set()
-            logger.info(
-                "RSS post finished poll=%d title=%r mark_read_ms=%.1f "
-                "total_elapsed_ms=%.1f posted_at=%s",
-                poll_id,
-                title,
-                (time.perf_counter() - stage_started) * 1000,
-                (time.perf_counter() - started) * 1000,
-                self._last_episode_posted_at.isoformat(),
+            if not claim.claimed and claim.posted_at is None:
+                recovered = await self._recover_pending_claim(claim)
+                if not recovered:
+                    claim = await run_blocking(
+                        self._claim_store.claim,
+                        normalized_title=normalized_title,
+                        display_title=candidate.title,
+                        source=candidate.source,
+                        source_id=candidate.source_id,
+                        published_at=candidate.published,
+                    )
+            if not claim.claimed:
+                logger.info(
+                    "Episode candidate deduplicated source=%s source_id=%s "
+                    "trigger=%s title=%r matched_source=%s matched_source_id=%s "
+                    "matched_title=%r matched_claimed_at=%s matched_posted_at=%s "
+                    "matched_message_id=%s total_elapsed_ms=%.1f",
+                    candidate.source,
+                    _safe_log_text(candidate.source_id),
+                    trigger,
+                    _safe_log_text(candidate.title),
+                    claim.source,
+                    _safe_log_text(claim.source_id),
+                    _safe_log_text(claim.display_title),
+                    claim.claimed_at.isoformat(),
+                    _format_log_datetime(claim.posted_at),
+                    claim.message_id or "none",
+                    (time.perf_counter() - started) * 1000,
+                )
+                return False
+
+            stage = "resolve-channel"
+            card_sent = False
+            try:
+                channel = self.bot.get_channel(TARGET_CHANNEL) or (
+                    await self.bot.fetch_channel(TARGET_CHANNEL)
+                )
+                stage = "resolve-role"
+                guild = channel.guild
+                role = guild.get_role(TARGET_ROLE) or (
+                    await guild.fetch_role(TARGET_ROLE)
+                )
+
+                stage = "build-card"
+                stage_started = time.perf_counter()
+                view = self._build_episode_card(candidate)
+                logger.info(
+                    "Episode card built source=%s source_id=%s title=%r "
+                    "elapsed_ms=%.1f",
+                    candidate.source,
+                    _safe_log_text(candidate.source_id),
+                    _safe_log_text(candidate.title),
+                    (time.perf_counter() - stage_started) * 1000,
+                )
+
+                stage = "send-card"
+                stage_started = time.perf_counter()
+                message = await channel.send(
+                    view=view, allowed_mentions=discord.AllowedMentions.none()
+                )
+                card_sent = True
+                posted_at = datetime.datetime.now(datetime.timezone.utc)
+                await run_blocking(
+                    self._claim_store.complete,
+                    normalized_title=normalized_title,
+                    source=candidate.source,
+                    source_id=candidate.source_id,
+                    message_id=message.id,
+                    posted_at=posted_at,
+                )
+                self._record_episode_posted(posted_at)
+                logger.info(
+                    "Episode card sent source=%s source_id=%s title=%r "
+                    "message_id=%d elapsed_ms=%.1f total_elapsed_ms=%.1f "
+                    "published_to_posted_seconds=%s observed_to_posted_seconds=%s",
+                    candidate.source,
+                    _safe_log_text(candidate.source_id),
+                    _safe_log_text(candidate.title),
+                    message.id,
+                    (time.perf_counter() - stage_started) * 1000,
+                    (time.perf_counter() - started) * 1000,
+                    _format_delta(posted_at, candidate.published),
+                    _format_delta(posted_at, candidate.observed_at),
+                )
+
+                stage = "send-mention"
+                stage_started = time.perf_counter()
+                try:
+                    mention = await channel.send(
+                        role.mention, allowed_mentions=discord.AllowedMentions.all()
+                    )
+                except Exception:
+                    logger.exception(
+                        "Episode mention failed source=%s source_id=%s title=%r "
+                        "card_message_id=%d",
+                        candidate.source,
+                        _safe_log_text(candidate.source_id),
+                        _safe_log_text(candidate.title),
+                        message.id,
+                    )
+                else:
+                    logger.info(
+                        "Episode mention sent source=%s source_id=%s title=%r "
+                        "message_id=%d elapsed_ms=%.1f",
+                        candidate.source,
+                        _safe_log_text(candidate.source_id),
+                        _safe_log_text(candidate.title),
+                        mention.id,
+                        (time.perf_counter() - stage_started) * 1000,
+                    )
+                return True
+            except Exception:
+                # A failed/ cancelled send may still have reached Discord.
+                # Keep that claim for history reconciliation on the next try.
+                if not card_sent and stage != "send-card":
+                    await run_blocking(
+                        self._claim_store.release,
+                        normalized_title=normalized_title,
+                        source=candidate.source,
+                        source_id=candidate.source_id,
+                    )
+                logger.exception(
+                    "Episode post failed source=%s source_id=%s title=%r "
+                    "stage=%s card_sent=%s total_elapsed_ms=%.1f",
+                    candidate.source,
+                    _safe_log_text(candidate.source_id),
+                    _safe_log_text(candidate.title),
+                    stage,
+                    card_sent,
+                    (time.perf_counter() - started) * 1000,
+                )
+                raise
+
+    async def _recover_pending_claim(self, claim):
+        """Reconcile an interrupted send before allowing RSS/inbox to retry.
+
+        Called under the shared post lock (one running bot per state database).
+        If history is unavailable, fail closed and leave the work retryable.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if (now - claim.claimed_at).total_seconds() < 30:
+            raise RuntimeError("pending episode send is awaiting reconciliation")
+        channel = self.bot.get_channel(TARGET_CHANNEL) or (
+            await self.bot.fetch_channel(TARGET_CHANNEL)
+        )
+        heading = "## " + _escape_display_text(_truncate_text(claim.display_title, 300))
+        async for message in channel.history(
+            after=claim.claimed_at - datetime.timedelta(seconds=5),
+            oldest_first=True, limit=None,
+        ):
+            if message.author.id != self.bot.user.id:
+                continue
+            if not any(_component_has_text(c.to_dict(), heading)
+                       for c in message.components):
+                continue
+            await run_blocking(
+                self._claim_store.complete,
+                normalized_title=claim.normalized_title,
+                source=claim.source, source_id=claim.source_id,
+                message_id=message.id, posted_at=message.created_at,
             )
-        except Exception:
-            logger.exception(
-                "RSS post failed poll=%d title=%r stage=%s total_elapsed_ms=%.1f",
-                poll_id,
-                title,
-                stage,
-                (time.perf_counter() - started) * 1000,
-            )
-            raise
+            self._record_episode_posted(message.created_at)
+            logger.warning("Episode pending claim recovered message_id=%d", message.id)
+            return True
+        await run_blocking(
+            self._claim_store.release,
+            normalized_title=claim.normalized_title,
+            source=claim.source, source_id=claim.source_id,
+        )
+        logger.warning("Episode pending claim had no Discord card; retrying")
+        return False
+
+    def _record_episode_posted(self, posted_at: datetime.datetime):
+        self._last_episode_posted_at = posted_at
+        posted_date_et = posted_at.astimezone(NY).date()
+        self._episode_posts_by_date[posted_date_et] = (
+            self._episode_posts_by_date.get(posted_date_et, 0) + 1
+        )
+        self._episode_posted_event.set()
 
     async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata]:
         feed_metadata = await self._get_feed_metadata(entry.feed_url)
@@ -838,24 +1072,19 @@ class EpPoster(commands.Cog):
         )
         return feed_metadata, item_metadata
 
-    async def _build_episode_card(self, entry) -> discord.ui.LayoutView:
-        feed_metadata, item_metadata = await self._get_item_metadata(entry)
+    def _build_episode_card(self, candidate: EpisodeCandidate) -> discord.ui.LayoutView:
         view = discord.ui.LayoutView(timeout=None)
 
-        feed_title = _escape_display_text(
-            entry.feed_resolved_title or feed_metadata.title
-        )
-        title = _escape_display_text(_truncate_text(entry.title or "New episode", 300))
-        summary = _escape_display_text(
-            _build_summary(_preferred_summary_source(entry, item_metadata))
-        )
+        feed_title = _escape_display_text(candidate.feed_title)
+        title = _escape_display_text(_truncate_text(candidate.title, 300))
+        summary = _escape_display_text(_build_summary(candidate.summary))
 
         metadata_bits = []
-        if item_metadata.episode_type and item_metadata.episode_type.title() != "Full":
-            metadata_bits.append(item_metadata.episode_type.title())
-        if duration := _format_duration(item_metadata.duration_seconds):
+        if candidate.episode_type and candidate.episode_type.title() != "Full":
+            metadata_bits.append(candidate.episode_type.title())
+        if duration := _format_duration(candidate.duration_seconds):
             metadata_bits.append(duration)
-        if published := _format_timestamp(entry.published):
+        if published := _format_timestamp(candidate.published):
             metadata_bits.append(published)
         metadata_bits.append("Posted by: Andy")
 
@@ -875,18 +1104,12 @@ class EpPoster(commands.Cog):
         if metadata_line:
             body_children.append(metadata_line)
 
-        primary_url = entry.link or item_metadata.link
-        audio_url = next(
-            (enclosure.href for enclosure in entry.enclosures if enclosure.href), None
-        )
-        image_url = item_metadata.image_url or feed_metadata.image_url
-
-        if image_url:
+        if candidate.image_url:
             body_section = discord.ui.Section(
                 *body_children,
                 accessory=discord.ui.Thumbnail(
-                    image_url,
-                    description=entry.title or "Episode art",
+                    candidate.image_url,
+                    description=candidate.title or "Episode art",
                 ),
             )
             card.add_item(body_section)
@@ -905,6 +1128,16 @@ async def setup(bot):
 ################################################################################
 # Formatting helpers
 
+def _component_has_text(value, text):
+    if isinstance(value, dict):
+        return value.get("content") == text or any(
+            _component_has_text(child, text) for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(_component_has_text(child, text) for child in value)
+    return False
+
+
 SUMMARY_LIMIT = 900
 SUMMARY_PARAGRAPH_LIMIT = 2
 SUMMARY_TRIM_MARKERS = (
@@ -918,6 +1151,7 @@ SUMMARY_TRIM_MARKERS = (
     "Subscribe to ",
     "Read ",
 )
+AD_FREE_SUFFIX_RE = re.compile(r"\s*\(ad-free\)\s*$", re.IGNORECASE)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -963,6 +1197,28 @@ def _normalize_whitespace(text: str | None) -> str | None:
         return None
     text = re.sub(r"\s+", " ", unescape(text)).strip()
     return text or None
+
+
+def _normalize_episode_title(title: str) -> str:
+    title = unicodedata.normalize("NFKC", unescape(title))
+    title = re.sub(r"\s+", " ", title).strip()
+    title = AD_FREE_SUFFIX_RE.sub("", title).strip()
+    return title.casefold()
+
+
+def _datetime_delta_seconds(
+    later: datetime.datetime | None, earlier: datetime.datetime | None
+) -> float | None:
+    if later is None or earlier is None:
+        return None
+    return (later - earlier).total_seconds()
+
+
+def _format_delta(
+    later: datetime.datetime | None, earlier: datetime.datetime | None
+) -> str:
+    value = _datetime_delta_seconds(later, earlier)
+    return f"{value:.3f}" if value is not None else "none"
 
 
 def _element_text(parent: ET.Element | None, path: str) -> str | None:
