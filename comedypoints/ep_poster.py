@@ -73,12 +73,16 @@ START_OF_TIME = datetime.datetime(2026, 3, 16, tzinfo=datetime.timezone.utc)
 ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
 FEED_FETCH_TIMEOUT = 15
+FEED_FETCH_ATTEMPTS = 2
+FEED_FETCH_RETRY_SECONDS = 1
 
 NY = ZoneInfo("America/New_York")
 SURPRISE_DROP_POLL_MINUTES = 15
+PUBLIC_EPISODE_WEEKDAY = 6  # Sunday; also the YouTube upload day
 EXPECTED_EPISODE_DAYS_OF_MONTH = {1, 11, 21}
 EXPECTED_EPISODE_START_TIME = datetime.time(hour=0, second=1, tzinfo=NY)
 EXPECTED_EPISODE_WINDOW = datetime.timedelta(minutes=10)
+EXPECTED_EPISODE_EARLY_GRACE = datetime.timedelta(minutes=5)
 EXPECTED_EPISODE_POLL_SECONDS = 12
 RSS_REQUEST_HEADERS_TO_LOG = (
     "cache-control",
@@ -107,6 +111,23 @@ RSS_RESPONSE_HEADERS_TO_LOG = (
     "x-served-by",
     "x-timer",
 )
+
+
+def _episode_date_for_post(posted_at: datetime.datetime) -> datetime.date:
+    """Return the Eastern date a post counts toward.
+
+    A card sent minutes before midnight (YouTube publishing a hair early)
+    belongs to the release the watcher expects at midnight, not to the
+    previous day; otherwise the watcher would poll for a post that already
+    happened and warn about a timeout.
+    """
+    posted_et = posted_at.astimezone(NY)
+    next_window = datetime.datetime.combine(
+        posted_et.date() + datetime.timedelta(days=1), EXPECTED_EPISODE_START_TIME
+    )
+    if next_window - posted_et <= EXPECTED_EPISODE_EARLY_GRACE:
+        return next_window.date()
+    return posted_et.date()
 
 
 def _format_log_datetime(value) -> str:
@@ -275,7 +296,7 @@ class EpPoster(commands.Cog):
         await run_blocking(self._claim_store.initialize)
         recent_post_times = await run_blocking(self._claim_store.recent_post_times)
         for posted_at in recent_post_times:
-            posted_date_et = posted_at.astimezone(NY).date()
+            posted_date_et = _episode_date_for_post(posted_at)
             self._episode_posts_by_date[posted_date_et] = (
                 self._episode_posts_by_date.get(posted_date_et, 0) + 1
             )
@@ -389,7 +410,7 @@ class EpPoster(commands.Cog):
 
     def _expected_episode_reasons(self, date: datetime.date) -> tuple[str, ...]:
         reasons = []
-        if date.weekday() == 6:
+        if date.weekday() == PUBLIC_EPISODE_WEEKDAY:
             reasons.append("sunday-public")
         if date.day in EXPECTED_EPISODE_DAYS_OF_MONTH:
             reasons.append(f"patreon-day-{date.day}")
@@ -735,53 +756,69 @@ class EpPoster(commands.Cog):
                     value.unmodified,
                 )
 
-    async def _get_feed_metadata(self, feed_url: str) -> FeedMetadata:
-        if cached := self._feed_cache.get(feed_url):
+    async def _get_feed_metadata(
+        self, feed_url: str, *, replace: FeedMetadata | None = None
+    ) -> tuple[FeedMetadata, bool]:
+        """Return (metadata, cache_hit).
+
+        A failed fetch is returned empty but never cached, so the next post
+        tries again. Passing ``replace`` refreshes the cache if it still holds
+        that exact object (used when a cached snapshot predates a new entry).
+        """
+        cached = self._feed_cache.get(feed_url)
+        if cached is not None and cached is not replace:
             logger.info(
                 "RSS metadata cache hit feed=%s items=%d",
                 self._feed_label(feed_url),
                 len(cached.items),
             )
-            return cached
+            return cached, True
 
         lock = self._feed_cache_locks.setdefault(feed_url, asyncio.Lock())
         async with lock:
-            if cached := self._feed_cache.get(feed_url):
+            cached = self._feed_cache.get(feed_url)
+            if cached is not None and cached is not replace:
                 logger.info(
                     "RSS metadata cache hit after lock feed=%s items=%d",
                     self._feed_label(feed_url),
                     len(cached.items),
                 )
-                return cached
+                return cached, True
 
             started = time.perf_counter()
             logger.info(
-                "RSS metadata fetch starting feed=%s timeout_seconds=%d",
+                "RSS metadata fetch starting feed=%s timeout_seconds=%d attempts=%d",
                 self._feed_label(feed_url),
                 FEED_FETCH_TIMEOUT,
+                FEED_FETCH_ATTEMPTS,
             )
-            try:
-                metadata = await run_blocking(_fetch_feed_metadata, feed_url)
-            except Exception as error:
-                logger.warning(
-                    "RSS metadata fetch failed feed=%s elapsed_ms=%.1f "
-                    "error_type=%s error=%s",
-                    self._feed_label(feed_url),
-                    (time.perf_counter() - started) * 1000,
-                    type(error).__name__,
-                    _safe_log_text(error),
-                )
-                metadata = FeedMetadata()
-            else:
-                logger.info(
-                    "RSS metadata fetch finished feed=%s elapsed_ms=%.1f items=%d",
-                    self._feed_label(feed_url),
-                    (time.perf_counter() - started) * 1000,
-                    len(metadata.items),
-                )
-
-            self._feed_cache[feed_url] = metadata
-            return metadata
+            for attempt in range(1, FEED_FETCH_ATTEMPTS + 1):
+                try:
+                    metadata = await run_blocking(_fetch_feed_metadata, feed_url)
+                except Exception as error:
+                    logger.warning(
+                        "RSS metadata fetch failed feed=%s attempt=%d elapsed_ms=%.1f "
+                        "error_type=%s error=%s",
+                        self._feed_label(feed_url),
+                        attempt,
+                        (time.perf_counter() - started) * 1000,
+                        type(error).__name__,
+                        _safe_log_text(error),
+                    )
+                    if attempt < FEED_FETCH_ATTEMPTS:
+                        await asyncio.sleep(FEED_FETCH_RETRY_SECONDS)
+                else:
+                    logger.info(
+                        "RSS metadata fetch finished feed=%s attempt=%d elapsed_ms=%.1f "
+                        "items=%d",
+                        self._feed_label(feed_url),
+                        attempt,
+                        (time.perf_counter() - started) * 1000,
+                        len(metadata.items),
+                    )
+                    self._feed_cache[feed_url] = metadata
+                    return metadata, False
+            return FeedMetadata(), False
 
     async def post_entry(self, entry, *, poll_id: int):
         started = time.perf_counter()
@@ -821,7 +858,9 @@ class EpPoster(commands.Cog):
         )
         return posted
 
-    async def post_youtube_video(self, video, *, webhook_received_at):
+    async def post_youtube_video(
+        self, video, *, webhook_received_at, trigger="youtube:websub"
+    ):
         candidate = EpisodeCandidate(
             source="youtube",
             source_id=video.video_id,
@@ -834,7 +873,7 @@ class EpPoster(commands.Cog):
             published=video.published,
             observed_at=webhook_received_at,
         )
-        return await self._post_candidate(candidate, trigger="youtube:websub")
+        return await self._post_candidate(candidate, trigger=trigger)
 
     async def _post_candidate(self, candidate: EpisodeCandidate, *, trigger: str):
         started = time.perf_counter()
@@ -1054,23 +1093,28 @@ class EpPoster(commands.Cog):
 
     def _record_episode_posted(self, posted_at: datetime.datetime):
         self._last_episode_posted_at = posted_at
-        posted_date_et = posted_at.astimezone(NY).date()
+        posted_date_et = _episode_date_for_post(posted_at)
         self._episode_posts_by_date[posted_date_et] = (
             self._episode_posts_by_date.get(posted_date_et, 0) + 1
         )
         self._episode_posted_event.set()
 
     async def _get_item_metadata(self, entry) -> tuple[FeedMetadata, FeedItemMetadata]:
-        feed_metadata = await self._get_feed_metadata(entry.feed_url)
-        item_metadata = next(
-            (
-                item
-                for item in feed_metadata.items
-                if _feed_item_matches_entry(item, entry)
-            ),
-            FeedItemMetadata("[unknown]"),
-        )
-        return feed_metadata, item_metadata
+        feed_metadata, cache_hit = await self._get_feed_metadata(entry.feed_url)
+        item_metadata = _matching_feed_item(feed_metadata, entry)
+        if item_metadata is None and cache_hit:
+            # The cached snapshot predates this entry; a fresh copy carries its
+            # duration and artwork, which the card would otherwise lose.
+            logger.info(
+                "RSS metadata cache lacks entry feed=%s source_id=%s; refreshing",
+                self._feed_label(entry.feed_url),
+                _safe_log_text(entry.id),
+            )
+            feed_metadata, _ = await self._get_feed_metadata(
+                entry.feed_url, replace=feed_metadata
+            )
+            item_metadata = _matching_feed_item(feed_metadata, entry)
+        return feed_metadata, item_metadata or FeedItemMetadata("[unknown]")
 
     def _build_episode_card(self, candidate: EpisodeCandidate) -> discord.ui.LayoutView:
         view = discord.ui.LayoutView(timeout=None)
@@ -1152,6 +1196,8 @@ SUMMARY_TRIM_MARKERS = (
     "Read ",
 )
 AD_FREE_SUFFIX_RE = re.compile(r"\s*\(ad-free\)\s*$", re.IGNORECASE)
+APOSTROPHE_RE = re.compile(r"['\u2018\u2019`]")
+NON_WORD_RE = re.compile(r"[^\w\s]")
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -1200,10 +1246,20 @@ def _normalize_whitespace(text: str | None) -> str | None:
 
 
 def _normalize_episode_title(title: str) -> str:
+    """Reduce a title to its words so YouTube and RSS spellings compare equal.
+
+    YouTube titles drop commas, hyphens and apostrophes inconsistently, e.g.
+    "New York New York with Lin Manuel Miranda" against the feed's
+    "New York, New York with Lin-Manuel Miranda (Ad-Free)". Apostrophes are
+    removed ("Doesn't" and "Doesnt" agree); other punctuation becomes a space
+    ("Lin-Manuel" and "Lin Manuel" agree).
+    """
     title = unicodedata.normalize("NFKC", unescape(title))
     title = re.sub(r"\s+", " ", title).strip()
-    title = AD_FREE_SUFFIX_RE.sub("", title).strip()
-    return title.casefold()
+    title = AD_FREE_SUFFIX_RE.sub("", title)
+    title = APOSTROPHE_RE.sub("", title)
+    title = NON_WORD_RE.sub(" ", title)
+    return re.sub(r"\s+", " ", title).strip().casefold()
 
 
 def _datetime_delta_seconds(
@@ -1408,6 +1464,13 @@ def _format_timestamp(timestamp: datetime.datetime | None) -> str | None:
     if timestamp is None:
         return None
     return f"<t:{int(timestamp.timestamp())}:f>"
+
+
+def _matching_feed_item(feed_metadata: FeedMetadata, entry) -> FeedItemMetadata | None:
+    return next(
+        (item for item in feed_metadata.items if _feed_item_matches_entry(item, entry)),
+        None,
+    )
 
 
 def _feed_item_matches_entry(item: FeedItemMetadata, entry) -> bool:

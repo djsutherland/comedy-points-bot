@@ -130,7 +130,7 @@ class SubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.cog._subscribe_once = AsyncMock(side_effect=[None, None, 120, None])
         with patch("comedypoints.youtube_websub.asyncio.sleep", new_callable=AsyncMock) as sleep:
             sleep.side_effect = [None, None, None, asyncio.CancelledError()]
-            with self.assertLogs("comedypoints.youtube_websub", level="WARNING"):
+            with self.assertLogs("comedypoints.youtube_websub", level="INFO"):
                 with self.assertRaises(asyncio.CancelledError):
                     await self.cog._subscription_loop()
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30, 120, 15])
@@ -154,7 +154,7 @@ class SubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("retry_after=120", headers)
         self.assertIn("'Retry-After': '120'", headers)
         rejected = next(line for line in logs.output if "request rejected" in line)
-        self.assertTrue(rejected.startswith("WARNING:"))
+        self.assertTrue(rejected.startswith("INFO:"))
         self.assertIn("status=503 retry_after=120", rejected)
         self.assertIn("body='Transient error; please try again later'", rejected)
 
@@ -165,11 +165,12 @@ class SubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.cog._subscribe_once = fail
         with patch("comedypoints.youtube_websub.asyncio.sleep", new_callable=AsyncMock) as sleep:
             sleep.side_effect = [None, asyncio.CancelledError()]
-            with self.assertLogs("comedypoints.youtube_websub", level="WARNING") as logs:
+            with self.assertLogs("comedypoints.youtube_websub", level="INFO") as logs:
                 with self.assertRaises(asyncio.CancelledError):
                     await self.cog._subscription_loop()
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [120, 30])
-        self.assertIn("retry_seconds=120 hub_retry_after=120", logs.output[0])
+        scheduled = [line for line in logs.output if "retry scheduled" in line]
+        self.assertIn("retry_seconds=120 hub_retry_after=120", scheduled[0])
 
     def test_retry_delay_honors_hub_retry_after_within_bounds(self):
         self.assertEqual(_subscription_retry_delay(1, 120), 120)

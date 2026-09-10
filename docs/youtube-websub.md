@@ -1,19 +1,45 @@
-# YouTube WebSub deployment
+# YouTube deployment
 
-The bot subscribes to the Blank Check channel using its immutable channel ID,
-`UCI8t9VKTB6uD91NvlC15oJA`. WebSub is enabled when all three variables are
-set:
+The bot watches the Blank Check channel, immutable channel ID
+`UCI8t9VKTB6uD91NvlC15oJA`, two ways: it polls the channel's uploads playlist
+through the YouTube Data API, and it subscribes to WebSub push notifications.
+Both feed the same posting path, so a video found by either mechanism, or its
+`(Ad-Free)` twin on the Patreon RSS feed, is announced exactly once.
 
 ```dotenv
+YOUTUBE_API_KEY=<server-restricted YouTube Data API v3 key>
 YOUTUBE_WEBSUB_CALLBACK_URL=https://example.com/an-unguessable-youtube-websub-path
 YOUTUBE_WEBSUB_SECRET=<a stable random secret under 200 bytes>
-YOUTUBE_API_KEY=<server-restricted YouTube Data API v3 key>
 ```
 
-The API key is required for posting: the bot waits for public status, title,
-description, and a positive duration. Missing configuration disables WebSub,
-leaving RSS active. Metadata failures stay queued for retry; they do not produce
-an incomplete card that suppresses the richer RSS version.
+The API key alone enables polling; the callback URL and secret additionally
+enable WebSub. Without the key, YouTube is disabled entirely and RSS stays
+active. The key is also required for posting: the bot waits for public status,
+title, description, and a positive duration. Metadata failures stay queued for
+retry; they do not produce an incomplete card that suppresses the richer RSS
+version.
+
+## Data API polling
+
+`playlistItems.list` on the uploads playlist (`UU` + the channel ID suffix,
+overridable with `YOUTUBE_UPLOADS_PLAYLIST_ID`) costs 1 quota unit per call.
+The poller runs every 60 seconds (`YOUTUBE_API_POLL_SECONDS`) and, on Sundays
+(Eastern, the public episode day), every 5 seconds from 30 seconds before the
+expected-episode start time until the RSS watcher's window closes. That is
+roughly 1,500 units per day against the default 10,000-unit allocation, plus
+one `videos.list` call per new video. The baseline poll covers surprise drops
+on other days.
+
+Videos published before the activation cutoff or more than six hours ago are
+marked seen without posting. New videos go through the same checks as WebSub
+deliveries (channel match, public status, complete metadata) and are retried on
+the next poll if metadata is still incomplete. Discovery is labelled
+`youtube:api` or `youtube:websub` in the logs, but both use the video ID as the
+source identity for dedupe. Against the RSS feed, titles are compared on words
+only: YouTube drops commas, hyphens and apostrophes inconsistently, so
+punctuation is ignored and the `(Ad-Free)` suffix stripped before matching.
+
+## WebSub
 
 The embedded callback server listens only on localhost by default:
 
@@ -59,6 +85,15 @@ mode (observed 2026-09-07). Nothing on our side fixes it; the retry loop picks
 up the subscription once the hub recovers. A `400` names the invalid parameter
 instead, and a missing verification (`awaiting verification` followed by
 `verification timed out`) points at the reverse proxy or callback path.
+
+## Alerting
+
+WARNING-level records reach the Discord DM log handler, so repeated failures
+are logged at INFO and summarised sparingly. The subscription loop emits one
+WARNING after 3 consecutive failures, then at most one per 24 hours while the
+outage lasts, plus one when it recovers. The Data API poller does the same
+after 5 consecutive failed polls. Individual failures, including the hub's
+response body, remain in the journal at INFO.
 
 Cross-source claims are stored in `episode-claims.sqlite` by default. Override
 that path with `EPISODE_CLAIMS_DB` if deployment state lives elsewhere. Keep the
