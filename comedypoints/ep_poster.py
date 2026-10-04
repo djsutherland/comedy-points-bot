@@ -1251,10 +1251,11 @@ def _normalize_episode_title(title: str) -> str:
     YouTube titles drop commas, hyphens and apostrophes inconsistently, e.g.
     "New York New York with Lin Manuel Miranda" against the feed's
     "New York, New York with Lin-Manuel Miranda (Ad-Free)". Apostrophes are
-    removed ("Doesn't" and "Doesnt" agree); other punctuation becomes a space
-    ("Lin-Manuel" and "Lin Manuel" agree).
+    removed ("Doesn't" and "Doesnt" agree); "&" reads as "and"; other
+    punctuation becomes a space ("Lin-Manuel" and "Lin Manuel" agree).
     """
     title = unicodedata.normalize("NFKC", unescape(title))
+    title = title.replace("&", " and ")
     title = re.sub(r"\s+", " ", title).strip()
     title = AD_FREE_SUFFIX_RE.sub("", title)
     title = APOSTROPHE_RE.sub("", title)

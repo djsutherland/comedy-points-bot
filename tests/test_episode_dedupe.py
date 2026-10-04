@@ -29,13 +29,13 @@ class EpisodeClaimStoreTests(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def claim(self, title, source, source_id, *, now=None):
+    def claim(self, title, source, source_id, *, now=None, published_at=None):
         return self.store.claim(
             normalized_title=_normalize_episode_title(title),
             display_title=title,
             source=source,
             source_id=source_id,
-            published_at=self.now,
+            published_at=published_at or self.now,
             now=now or self.now,
         )
 
@@ -61,6 +61,97 @@ class EpisodeClaimStoreTests(unittest.TestCase):
         patreon = self.claim("A Patreon Bonus (Ad-Free)", "rss", "rss-2")
         self.assertTrue(public.claimed)
         self.assertTrue(patreon.claimed)
+
+    def test_youtube_title_without_guest_matches_rss_title(self):
+        youtube = self.claim("The Color of Money", "youtube", "HiaS58a8rZs")
+        self.assertTrue(youtube.claimed)
+        rss = self.claim(
+            "The Color of Money with Chris Ryan (Ad-Free)", "rss", "169324704",
+            published_at=self.now - datetime.timedelta(seconds=20),
+        )
+        self.assertFalse(rss.claimed)
+        self.assertEqual(rss.source_id, "HiaS58a8rZs")
+        # The link is remembered, so a later RSS replay still dedupes.
+        again = self.claim(
+            "The Color of Money with Chris Ryan (Ad-Free)", "rss", "169324704",
+            published_at=self.now + datetime.timedelta(days=7),
+        )
+        self.assertFalse(again.claimed)
+
+    def test_rss_title_with_guest_first_matches_youtube_without_guest(self):
+        self.assertTrue(
+            self.claim("The Color of Money with Chris Ryan (Ad-Free)", "rss", "r").claimed
+        )
+        self.assertFalse(self.claim("The Color of Money", "youtube", "v").claimed)
+
+    def test_guest_variant_needs_close_publish_times(self):
+        self.claim("The Color of Money", "youtube", "v")
+        rss = self.claim(
+            "The Color of Money with Chris Ryan (Ad-Free)", "rss", "r",
+            published_at=self.now + datetime.timedelta(days=1),
+        )
+        self.assertTrue(rss.claimed)
+
+    def test_guest_variant_ignores_same_source_and_already_paired_claims(self):
+        self.claim("Some Movie", "rss", "r1")
+        self.assertTrue(self.claim("Some Movie with A Guest", "rss", "r2").claimed)
+        self.claim("Other Movie", "youtube", "v1")
+        self.claim("Other Movie (Ad-Free)", "rss", "r3")
+        self.assertTrue(self.claim("Other Movie with Bonus", "rss", "r4").claimed)
+
+    def test_similar_titles_without_guest_suffix_stay_separate(self):
+        self.claim("Resident Evil", "youtube", "v")
+        self.assertTrue(self.claim("Resident Evil: Afterlife", "rss", "r").claimed)
+
+    def test_historical_youtube_title_variants_match_rss_titles(self):
+        pairs = [
+            ("Citizens Band/ Last Embrace",
+             "Citizens Band/ Last Embrace with Justin McElroy (Ad-Free)"),
+            ("The Eleventh Annual Blank Check Awards with Joe Reid",
+             "The Eleventh Annual Blank Check Awards (Ad-Free)"),
+            ("Morvern Caller with Emily Yoshida",
+             "Morvern Callar with Emily Yoshida (Ad-Free)"),
+            ("Something Wild with Scott Auckerman",
+             "Something Wild with Scott Aukerman (Ad-Free)"),
+            ("Twin Peaks: The Return (Eps 1-7)",
+             "Twin Peaks: The Return (Episodes 1-7) (Ad-Free)"),
+            ("Twin Peaks: The Return (Ep 8) with Connor Ratliff",
+             "Twin Peaks: The Return (Episode 8) with Connor Ratliff (Ad-Free)"),
+            ("The Boy and the Heron J.D. Amato",
+             "The Boy and the Heron with J.D. Amato (Ad-Free)"),
+            ("Batman v Superman: Dawn of Justice - The Lost Episode",
+             "Batman v Superman: Dawn of Justice - The Lost Episode "
+             "(Remastered) (Ad-Free)"),
+            ("Watch With Us Live @ Union Hall - Revenge Of The Podcast",
+             "Watch With Us LIVE! - Revenge Of The Podcast (Ad-Free)"),
+        ]
+        for i, (youtube_title, rss_title) in enumerate(pairs):
+            published_at = self.now + datetime.timedelta(days=i)
+            with self.subTest(youtube_title):
+                self.assertTrue(self.claim(
+                    youtube_title, "youtube", f"v{i}", published_at=published_at
+                ).claimed)
+                self.assertFalse(self.claim(
+                    rss_title, "rss", f"r{i}", published_at=published_at
+                ).claimed)
+
+    def test_differently_numbered_episodes_stay_separate(self):
+        pairs = [
+            ("Superman II", "Superman III (Ad-Free)"),
+            ("The Devil Wears Prada with Romilly Newman",
+             "The Devil Wears Prada 2 with Romilly Newman (Ad-Free)"),
+            ("The Tenth Annual Blank Check Awards with Joe Reid",
+             "The Seventh Annual Blank Check Awards with Joe Reid (Ad-Free)"),
+            ("Titanic with Emily Yoshida and Katey Rich Part One",
+             "Titanic with Emily Yoshida and Katey Rich Part Two (Ad-Free)"),
+        ]
+        for i, (youtube_title, rss_title) in enumerate(pairs):
+            published_at = self.now + datetime.timedelta(days=i)
+            with self.subTest(youtube_title):
+                self.claim(youtube_title, "youtube", f"v{i}", published_at=published_at)
+                self.assertTrue(self.claim(
+                    rss_title, "rss", f"r{i}", published_at=published_at
+                ).claimed)
 
     def test_repeat_source_id_is_deduplicated_even_if_title_changes(self):
         self.assertTrue(self.claim("Original Title", "youtube", "video-1").claimed)
@@ -111,6 +202,16 @@ class EpisodeClaimStoreTests(unittest.TestCase):
 
 
 class TitleNormalizationTests(unittest.TestCase):
+    def test_ampersand_matches_and(self):
+        self.assertEqual(
+            _normalize_episode_title(
+                "Last Action Hero with Paul Scheer & Jason Mantzoukas (Ad-Free)"
+            ),
+            _normalize_episode_title(
+                "Last Action Hero with Paul Scheer and Jason Mantzoukas"
+            ),
+        )
+
     def test_only_terminal_ad_free_suffix_is_removed(self):
         self.assertEqual(
             _normalize_episode_title("  Resident Evil: Extinction (Ad-Free) "),

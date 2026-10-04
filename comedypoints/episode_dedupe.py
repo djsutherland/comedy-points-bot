@@ -1,4 +1,5 @@
 import datetime
+import difflib
 from contextlib import contextmanager
 from dataclasses import dataclass
 import sqlite3
@@ -6,6 +7,13 @@ import sqlite3
 
 UTC = datetime.timezone.utc
 CLAIM_RETENTION = datetime.timedelta(days=30)
+TITLE_VARIANT_WINDOW = datetime.timedelta(hours=6)
+TITLE_VARIANT_SIMILARITY = 0.85
+NUMBER_WORDS = frozenset("""
+    one two three four five six seven eight nine ten eleven twelve
+    first second third fourth fifth sixth seventh eighth ninth tenth eleventh
+    twelfth ii iii iv v vi vii viii ix x xi xii
+""".split())
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,10 @@ class EpisodeClaimStore:
                     (SELECT normalized_title FROM episode_sources
                      WHERE source = ? AND source_id = ?), ?)
             """, (source, source_id, normalized_title)).fetchone()
+            if row is None and published_at is not None:
+                row = _find_title_variant_claim(
+                    db, normalized_title, source, _as_utc(published_at)
+                )
             if row is not None:
                 db.execute(
                     "INSERT OR IGNORE INTO episode_sources VALUES (?, ?, ?)",
@@ -241,6 +253,51 @@ class WebSubInbox(EpisodeClaimStore):
                 ((datetime.datetime.now(UTC) + datetime.timedelta(seconds=delay))
                  .isoformat(), digest))
         return delay
+
+
+def _find_title_variant_claim(db, normalized_title, source, published_at):
+    """Match the same episode titled slightly differently by the other source.
+
+    YouTube and the feed disagree now and then: a dropped guest ("The Color of
+    Money" against "... with Chris Ryan"), typos ("Auckerman"/"Aukerman"),
+    abbreviations ("Eps 1-7"/"Episodes 1-7"). Different episodes can look just
+    as close ("Superman II"/"Superman III"), so only pair claims from another
+    source, published close together, that don't already have a claim from
+    this source.
+    """
+    rows = db.execute("""
+        SELECT c.normalized_title, c.display_title, c.source, c.source_id,
+               c.claimed_at, c.posted_at, c.message_id, c.published_at
+        FROM episode_claims c
+        WHERE c.source != ? AND c.published_at IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM episode_sources s
+                WHERE s.normalized_title = c.normalized_title AND s.source = ?)
+    """, (source, source)).fetchall()
+    matches = [
+        (abs(_parse_datetime(row[7]) - published_at), row[:7])
+        for row in rows
+        if abs(_parse_datetime(row[7]) - published_at) <= TITLE_VARIANT_WINDOW
+        and _is_title_variant(row[0], normalized_title)
+    ]
+    return min(matches)[1] if matches else None
+
+
+def _is_title_variant(a: str, b: str) -> bool:
+    short, long = sorted((a, b), key=len)
+    if long.startswith(short + " with "):
+        return True
+    return (
+        _number_tokens(a) == _number_tokens(b)
+        and difflib.SequenceMatcher(None, a, b).ratio() >= TITLE_VARIANT_SIMILARITY
+    )
+
+
+def _number_tokens(title: str) -> list[str]:
+    return [
+        word for word in title.split()
+        if word.isdigit() or word in NUMBER_WORDS
+    ]
 
 
 def _as_utc(value: datetime.datetime) -> datetime.datetime:
