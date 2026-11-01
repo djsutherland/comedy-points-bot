@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import functools
 from html import unescape
 from html.parser import HTMLParser
-from logging import getLogger
+from logging import DEBUG, getLogger
 import os
 from pathlib import Path
 import re
@@ -96,6 +96,7 @@ RSS_RESPONSE_HEADERS_TO_LOG = (
     "cf-cache-status",
     "cf-ray",
     "content-length",
+    "content-type",
     "date",
     "etag",
     "expires",
@@ -168,15 +169,17 @@ def _selected_headers(headers, names: tuple[str, ...]) -> dict[str, str]:
 
 def _log_feed_http_response(session, response, request, **kwargs):
     del session, kwargs
+    if not logger.isEnabledFor(DEBUG):
+        return
     request_headers = _selected_headers(
         request.headers or {}, RSS_REQUEST_HEADERS_TO_LOG
     )
     response_headers = _selected_headers(
         response.headers, RSS_RESPONSE_HEADERS_TO_LOG
     )
-    logger.info(
+    logger.debug(
         "RSS HTTP response feed=%s status=%d elapsed_ms=%.1f "
-        "request_cache_headers=%r response_cache_headers=%r",
+        "request_cache_headers=%r response_headers=%r",
         _feed_label_for_url(str(request.url)),
         response.status_code,
         response.elapsed.total_seconds() * 1000,
@@ -363,14 +366,14 @@ class EpPoster(commands.Cog):
     @tasks.loop(minutes=SURPRISE_DROP_POLL_MINUTES)
     async def check_feeds(self):
         if self._expecting_episode:
-            logger.info("RSS fallback poll skipped reason=episode-watcher-active")
+            logger.debug("RSS fallback poll skipped reason=episode-watcher-active")
             return
         try:
             await self._check_feeds(trigger="fallback")
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.error(
+            logger.exception(
                 "RSS fallback poll failed error_type=%s error=%s",
                 type(error).__name__,
                 _safe_log_text(error, limit=1000),
@@ -386,6 +389,7 @@ class EpPoster(commands.Cog):
             "RSS fallback polling loop stopped error_type=%s error=%s",
             type(error).__name__,
             _safe_log_text(error, limit=1000),
+            exc_info=(type(error), error, error.__traceback__),
         )
 
     @tasks.loop(time=EXPECTED_EPISODE_START_TIME)
@@ -402,6 +406,7 @@ class EpPoster(commands.Cog):
             "RSS expected-episode loop stopped error_type=%s error=%s",
             type(error).__name__,
             _safe_log_text(error, limit=1000),
+            exc_info=(type(error), error, error.__traceback__),
         )
 
     async def _run_startup_expectation(self):
@@ -501,7 +506,7 @@ class EpPoster(commands.Cog):
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
-                    logger.error(
+                    logger.exception(
                         "RSS episode watcher poll failed trigger=%s reason=%s "
                         "attempt=%d error_type=%s error=%s",
                         trigger,
@@ -533,7 +538,7 @@ class EpPoster(commands.Cog):
                     max(0, EXPECTED_EPISODE_POLL_SECONDS - poll_elapsed),
                     remaining,
                 )
-                logger.info(
+                logger.debug(
                     "RSS episode watcher scheduling next poll trigger=%s "
                     "reason=%s attempt=%d poll_elapsed_seconds=%.1f "
                     "wait_seconds=%.1f",
@@ -583,7 +588,7 @@ class EpPoster(commands.Cog):
         lock_started = started
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         now_et = now_utc.astimezone(NY)
-        logger.info(
+        logger.debug(
             "RSS poll starting poll=%d trigger=%s at_utc=%s at_et=%s",
             poll_id,
             trigger,
@@ -593,14 +598,15 @@ class EpPoster(commands.Cog):
 
         async with self._update_lock:
             lock_acquired = time.perf_counter()
-            logger.info(
+            logger.debug(
                 "RSS poll lock acquired poll=%d wait_ms=%.1f",
                 poll_id,
                 (lock_acquired - lock_started) * 1000,
             )
 
-            before_feeds = await self._feed_diagnostics()
-            self._log_feed_diagnostics(poll_id, "before", before_feeds)
+            if logger.isEnabledFor(DEBUG):
+                before_feeds = await self._feed_diagnostics()
+                self._log_feed_diagnostics(poll_id, "before", before_feeds)
 
             update_started = time.perf_counter()
             # Use the iterator so per-feed parse and HTTP failures are observable.
@@ -609,30 +615,35 @@ class EpPoster(commands.Cog):
                 default=None,
             )
             update_finished = time.perf_counter()
-            logger.info(
+            logger.debug(
                 "RSS update finished poll=%d elapsed_ms=%.1f result_count=%s",
                 poll_id,
                 (update_finished - update_started) * 1000,
                 "failed" if update_results is None else len(update_results),
             )
+            new, modified, errors = 0, 0, 1
             if update_results is not None:
-                self._log_update_results(poll_id, update_results)
+                new, modified, errors = self._log_update_results(poll_id, update_results)
 
-            after_feeds = await self._feed_diagnostics()
-            self._log_feed_diagnostics(poll_id, "after", after_feeds)
+            if logger.isEnabledFor(DEBUG):
+                after_feeds = await self._feed_diagnostics()
+                self._log_feed_diagnostics(poll_id, "after", after_feeds)
 
             async with asyncio.TaskGroup() as tg:
-                posted = 0
+                post_tasks = []
                 entries = await self._run_reader(
-                    lambda reader: list(reader.get_entries(read=False)), default=[]
+                    lambda reader: list(reader.get_entries(read=False)), default=None
                 )
-                logger.info(
+                if entries is None:
+                    errors += 1
+                    entries = []
+                logger.debug(
                     "RSS unread entries poll=%d count=%d",
                     poll_id,
                     len(entries),
                 )
                 for entry in entries:
-                    logger.info(
+                    logger.debug(
                         "RSS unread entry poll=%d title=%r published=%s "
                         "first_seen=%s last_updated=%s",
                         poll_id,
@@ -643,24 +654,38 @@ class EpPoster(commands.Cog):
                     )
                     if (
                         not entry.published or entry.published > START_OF_TIME
-                    ) and posted <= 3:
-                        tg.create_task(self.post_entry(entry, poll_id=poll_id))
-                        posted += 1
+                    ) and len(post_tasks) <= 3:
+                        post_tasks.append(
+                            tg.create_task(self.post_entry(entry, poll_id=poll_id))
+                        )
                     else:
                         logger.info(
                             "RSS entry skipped poll=%d title=%r reason=%s",
                             poll_id,
                             _safe_log_text(entry.title),
-                            "post-limit" if posted > 3 else "before-start-of-time",
+                            "post-limit" if len(post_tasks) > 3 else "before-start-of-time",
                         )
                         tg.create_task(
                             self._run_reader_method("mark_entry_as_read", entry)
                         )
 
-            logger.info(
-                "RSS poll finished poll=%d posted=%d total_elapsed_ms=%.1f",
+            log = (
+                logger.info
+                if trigger in {"fallback", "manual"} or new or modified or entries or errors
+                else logger.debug
+            )
+            log(
+                "RSS poll finished poll=%d trigger=%s status=%s new=%d modified=%d "
+                "errors=%d unread=%d post_attempts=%d posted=%d total_elapsed_ms=%.1f",
                 poll_id,
-                posted,
+                trigger,
+                "error" if errors else "ok",
+                new,
+                modified,
+                errors,
+                len(entries),
+                len(post_tasks),
+                sum(bool(task.result()) for task in post_tasks),
                 (time.perf_counter() - started) * 1000,
             )
 
@@ -708,7 +733,7 @@ class EpPoster(commands.Cog):
                 exception_text = _safe_log_text(
                     f"{last_exception.type_name}: {last_exception.value_str}"
                 )
-            logger.info(
+            logger.debug(
                 "RSS feed state poll=%d phase=%s feed=%s title=%r "
                 "last_retrieved=%s last_updated=%s update_after=%s "
                 "last_exception=%s latest_entry=%r latest_published=%s "
@@ -727,10 +752,12 @@ class EpPoster(commands.Cog):
             )
 
     def _log_update_results(self, poll_id: int, results):
+        new = modified = errors = 0
         for result in results:
             feed_url, value = result
             feed_label = self._feed_label(feed_url)
             if isinstance(value, Exception):
+                errors += 1
                 logger.error(
                     "RSS update result poll=%d feed=%s status=error "
                     "error_type=%s error=%s",
@@ -740,13 +767,15 @@ class EpPoster(commands.Cog):
                     _safe_log_text(value),
                 )
             elif value is None:
-                logger.info(
+                logger.debug(
                     "RSS update result poll=%d feed=%s status=server-unchanged",
                     poll_id,
                     feed_label,
                 )
             else:
-                logger.info(
+                new += value.new
+                modified += value.modified
+                logger.debug(
                     "RSS update result poll=%d feed=%s status=fetched new=%d "
                     "modified=%d unmodified=%d",
                     poll_id,
@@ -755,6 +784,7 @@ class EpPoster(commands.Cog):
                     value.modified,
                     value.unmodified,
                 )
+        return new, modified, errors
 
     async def _get_feed_metadata(
         self, feed_url: str, *, replace: FeedMetadata | None = None
