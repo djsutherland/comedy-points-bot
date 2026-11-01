@@ -1,5 +1,0 @@
-aiohttp==3.12.*
-discord-lumberjack==1.1.*
-discord.py==2.7.*
-python-dotenv==1.*
-reader==3.*

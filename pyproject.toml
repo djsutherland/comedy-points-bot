@@ -1,0 +1,16 @@
+[project]
+name = "comedy-points-bot"
+version = "0.1.0"
+description = "Discord bot for comedy points and podcast episode announcements"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp==3.12.*",
+    "discord-lumberjack==1.1.*",
+    "discord.py==2.7.*",
+    "python-dotenv==1.*",
+    "reader==3.*",
+]
+
+[tool.uv]
+package = false
