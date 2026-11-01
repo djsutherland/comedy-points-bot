@@ -1,14 +1,16 @@
 from contextlib import redirect_stderr
+from datetime import timedelta
 import io
 import logging
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from reader import ParseError
 from reader._parser.feedparser import FeedparserParser
+from requests import Response
 
-from comedypoints.ep_poster import EpPoster
+from comedypoints.ep_poster import EpPoster, _make_initialized_reader
 from comedypoints.logging_config import configure_logging
 
 
@@ -139,6 +141,42 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(self.dm.getvalue(), "")
         with self.assertRaises(ParseError):
             parser(PRIVATE_URL, io.BytesIO(b"<rss><channel>"), {"server": "test"})
+
+
+class ReaderHttpLoggingTests(unittest.TestCase):
+    def test_initialized_reader_logs_http_and_https_responses_once(self):
+        with self.assertNoLogs("comedypoints.ep_poster", level="WARNING"):
+            reader = _make_initialized_reader(":memory:")
+            self.addCleanup(reader.close)
+
+        for scheme in ("http", "https"):
+            with self.subTest(scheme=scheme):
+                url = PRIVATE_URL.replace("https:", f"{scheme}:")
+                reader.add_feed(url)
+                retriever = reader._parser.get_retriever(url)
+                self.addCleanup(retriever.session.close)
+                response = Response()
+                response.status_code = 200
+                response.url = url
+                response.elapsed = timedelta(milliseconds=12)
+                response.headers.update({
+                    "Content-Type": "application/rss+xml",
+                    "Cache-Control": "max-age=60",
+                    "Set-Cookie": "private-cookie",
+                })
+                response.raw = io.BytesIO(b'''<rss version="2.0"><channel>
+                    <title>Test feed</title><item><guid>entry-1</guid>
+                    <title>Test entry</title></item></channel></rss>''')
+                with patch.object(retriever.session, "send", return_value=response), \
+                     self.assertLogs("comedypoints.ep_poster", level="DEBUG") as logs:
+                    result = reader.update_feed(url)
+                self.assertEqual(result.new, 1)
+                self.assertEqual(len(logs.output), 1, logs.output)
+                self.assertIn("RSS HTTP response", logs.output[0])
+                self.assertIn("'content-type': 'application/rss+xml'", logs.output[0])
+                self.assertIn("'cache-control': 'max-age=60'", logs.output[0])
+                self.assertNotIn("private-test-token", logs.output[0])
+                self.assertNotIn("private-cookie", logs.output[0])
 
 
 class RssPollLoggingTests(unittest.IsolatedAsyncioTestCase):

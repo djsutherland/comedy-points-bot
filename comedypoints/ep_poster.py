@@ -246,15 +246,23 @@ async def run_in_thread(func, *args, default=None, executor=None, **kwargs):
 def _make_initialized_reader(db_path: str):
     reader = make_reader(db_path)
     parser = getattr(reader, "_parser", None)
-    getattr(parser, "_lazy_init", lambda: None)()
-    session_factory = getattr(parser, "session_factory", None)
-    if session_factory is None:
-        logger.warning("RSS HTTP header logging unavailable reason=no-session-factory")
-    else:
-        session_factory.response_hooks = [
-            *session_factory.response_hooks,
-            _log_feed_http_response,
-        ]
+    get_retriever = getattr(parser, "get_retriever", None)
+    if get_retriever is None:
+        logger.warning("RSS HTTP header logging unavailable reason=no-http-retriever")
+        return reader
+
+    for scheme in ("https://", "http://"):
+        # get_retriever initializes the parser lazily. Current reader versions
+        # keep response hooks on HTTPRetriever, not on a parser session factory.
+        response_hooks = getattr(get_retriever(scheme), "response_hooks", None)
+        if response_hooks is None:
+            logger.warning(
+                "RSS HTTP header logging unavailable scheme=%s reason=no-response-hooks",
+                scheme,
+            )
+        elif _log_feed_http_response not in response_hooks:
+            # HTTP and HTTPS normally share the same retriever.
+            response_hooks.append(_log_feed_http_response)
     return reader
 
 
